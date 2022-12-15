@@ -1,4 +1,8 @@
 ﻿// logical_device.cpp
+// 目前这是我上传的第一版vulkan代码，连三角形还画不出来，目前主要用来初始化仓库
+// 要点记录，这里的vulkan封装是基于glfw的，可以到官方下载，另外还需要的三方库有glm
+// 这些三方库都统一放到VulkanSDK/1.xxx.xxxx目录下的Third-Party目录中（新建目录）
+// 子目录新建Bin32，Bin64（32和64主要用于区分版本，目前我只创建了Bin64用于存放lib和dll）和Include
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
@@ -12,6 +16,7 @@
 const int WIDTH = 800;
 const int HEIGHT = 600;
 
+// KHR vk的默认调试层，应该是开启了所有的调试的
 const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
@@ -23,6 +28,8 @@ const bool enableValidationLayers = true;
 #endif
 
 VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDebugUtilsMessengerEXT* pDebugMessenger) {
+    // vk中的很多函数都不是可以直接调用的，需要先通过vkGetInstanceProcAddr来获取到函数后，才能使用
+    // 而vkGetInstancePorcAddr是从vk的dll中加载出来的函数，vulkan-1.dll
     auto func = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
     if (func != nullptr) {
         return func(instance, pCreateInfo, pAllocator, pDebugMessenger);
@@ -76,10 +83,15 @@ private:
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
     }
 
+    // 这是vulkan相关很重要的一个函数，包含了各种vulkan需要的初始化，目前还不完全
     void initVulkan() {
+        // 实例的创建，vulkan中很重要的概念
         createInstance();
+        // debug的设置函数，需要开启validation layer的相关设置，才能正常调试，默认vk是不开启调试层的
         setupDebugMessenger();
+        // 物理设备的创建
         pickPhysicalDevice();
+        // 逻辑设备的创建
         createLogicalDevice();
     }
 
@@ -96,6 +108,7 @@ private:
             DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         }
 
+        // 基本上目前看到的情况，所有实例以外的vk创建obj，都应该在销毁vk实例前，进行销毁，否则debug的回调是可以看到错误信息的
         vkDestroyInstance(instance, nullptr);
 
         glfwDestroyWindow(window);
@@ -293,6 +306,7 @@ private:
         return true;
     }
 
+    // 调试回调函数，需要提前设置开启，就可以接收到vk的各种层级的调试信息了（verbose，debug，warning，error等）
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) {
         std::cerr << "validation layer: " << pCallbackData->pMessage << std::endl;
 
@@ -301,6 +315,8 @@ private:
 };
 
 int main() {
+    // 对vulkan的处理过程进行了封装，保持main函数中的主体循环看起来尽量的简洁易懂
+    // 本例结合了glfw的窗口创建（这些窗口其实是和vulkan无关的系统操作相关）
     HelloTriangleApplication app;
 
     try {
