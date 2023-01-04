@@ -15,9 +15,14 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <fstream>
 
 const int WIDTH = 800;
 const int HEIGHT = 600;
+
+// 关于vk pipeline的一些重点知识：
+// 如果之前使用过旧的API(OpenGL和Direct3D),那么将可以随意通过glBlendFunc和OMSetBlendState调用更改管线设置。Vulkan中的图形管线几乎不可改变，因此如果需要更改着色器，绑定到不同的帧缓冲区或者更改混合函数，则必须从头创建管线。
+// 缺点是必须创建一些管线，这些管线代表在渲染操作中使用的不同的组合状态。但是由于所有管线的操作都是提前知道的，所以可以通过驱动程序更好的优化它
 
 // KHR vk的默认调试层，应该是开启了所有的调试的
 const std::vector<const char*> validationLayers = {
@@ -29,6 +34,29 @@ const bool enableValidationLayers = false;
 #else
 const bool enableValidationLayers = true;
 #endif
+
+static std::vector<char> readFile(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("failed to open file!");
+    }
+
+    // readFile函数将会从文件中读取所有的二进制数据，并用std::vector字节集合管理。我们使用两个标志用以打开文件:
+    // ate:在文件末尾开始读取
+    // binary : 以二进制格式去读文件(避免字符格式的转义)
+    // 从文件末尾开始读取的优点是我们可以使用读取位置来确定文件的大小并分配缓冲区
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+
+    // 之后我们可以追溯到文件的开头，同时读取所有的字节
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+
+    // 最后关闭文件，返回字节数据
+    file.close();
+    return buffer;
+}
 
 VkResult CreateDebugUtilsMessengerEXT(VkInstance instance, const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDebugUtilsMessengerEXT* pDebugMessenger) {
     // vk中的很多函数都不是可以直接调用的，需要先通过vkGetInstanceProcAddr来获取到函数后，才能使用
@@ -82,6 +110,7 @@ private:
     VkDevice device;// 逻辑设备
 
     VkQueue graphicsQueue;// 用于记录图形队列的索引
+    VkQueue presentQueue;// 还有一件事，就是修改逻辑设备的创建过程，以创建呈现队列并获取VkQueue句柄，还是要添加一个变量
 
     // Vulkan Window Surface，到目前为止，我们了解到Vulkan是一个与平台特性无关联的API集合。它不能直接与窗口系统进行交互。为了将渲染结果呈现到屏幕，需要建立Vulkan与窗体系统之间的连接，我们需要使用WSI(窗体系统集成)扩展。
     // 在本小节中，我们将讨论第一个，即VK_KHR_surface(VK_KHR_win32_surface)。它暴露了VkSurfaceKHR，它代表surface的一个抽象类型，用以呈现渲染图像使用。
@@ -116,6 +145,9 @@ private:
     VkSwapchainKHR swapChain;// 现在添加一个类成员变量存储VkSwapchainKHR对象:
     // 交换链创建后，需要获取VkImage相关的句柄。它会在后续渲染的章节中引用。添加类成员变量存储该句柄:
     std::vector<VkImage> swapChainImages;// 图像被交换链创建，也会在交换链销毁的同时自动清理，所以我们不需要添加任何清理代码。
+    // Vulkan 图像与视图，使用任何的VkImage，包括在交换链或者渲染管线中的，我们都需要创建VkImageView对象。
+    // 从字面上理解它就是一个针对图像的视图或容器，通过它具体的渲染管线才能够读写渲染数据，换句话说VkImage不能与渲染管线进行交互
+    std::vector<VkImageView> swapChainImageViews;
     VkFormat swapChainImageFormat;
     VkExtent2D swapChainExtent;
 
@@ -156,6 +188,10 @@ private:
         createLogicalDevice();
         // 创建交换链
         createSwapChain();
+        // 创建图像视图
+        createImageViews();
+        // 创建图形管线
+        createGraphicsPipeline();
     }
 
     void mainLoop() {
@@ -165,6 +201,11 @@ private:
     }
 
     void cleanup() {
+        // 与图像不同的是，图像视图需要明确的创建过程，所以在程序退出的时候，我们需要添加一个循环去销毁他们
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            vkDestroyImageView(device, swapChainImageViews[i], nullptr);
+        }
+
         vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroySwapchainKHR(device, swapChain, nullptr);
 
@@ -275,13 +316,26 @@ private:
 
     void createLogicalDevice() {
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        uint32_t queueFamilyIndices[] = { (uint32_t)indices.graphicsFamily.value(), (uint32_t)indices.presentFamily.value() };
+        std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+
+        // 接着，我们需要多个VkDeviceQueueCreateInfo结构体来从两个簇创建队列。比较好的做法时创建一套所需队列各不相同的队列簇
+        float queuePriority = 1.0f;
+        for (uint32_t queueFamily : queueFamilyIndices) {
+            VkDeviceQueueCreateInfo queueCreateInfo = {};
+            queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queueCreateInfo.queueFamilyIndex = queueFamily;
+            queueCreateInfo.queueCount = 1;
+            queueCreateInfo.pQueuePriorities = &queuePriority;
+            queueCreateInfos.push_back(queueCreateInfo);
+        }
+
 
         VkDeviceQueueCreateInfo queueCreateInfo = {};
         queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         queueCreateInfo.queueFamilyIndex = indices.graphicsFamily.value();
         queueCreateInfo.queueCount = 1;
 
-        float queuePriority = 1.0f;
         queueCreateInfo.pQueuePriorities = &queuePriority;
 
         VkPhysicalDeviceFeatures deviceFeatures = {};
@@ -289,8 +343,11 @@ private:
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
-        createInfo.pQueueCreateInfos = &queueCreateInfo;
-        createInfo.queueCreateInfoCount = 1;
+//         createInfo.pQueueCreateInfos = &queueCreateInfo;
+//         createInfo.queueCreateInfoCount = 1;
+        // 动态创建2个队列簇，一个是graphics的，一个是present的
+        createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+        createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
         createInfo.pEnabledFeatures = &deviceFeatures;
 
@@ -314,6 +371,7 @@ private:
         }
 
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
+        vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
     }
 
     void createSwapChain() {
@@ -351,12 +409,12 @@ private:
         uint32_t queueFamilyIndices[] = { (uint32_t)indices.graphicsFamily.value(), (uint32_t)indices.presentFamily.value() };
 
         if (indices.graphicsFamily != indices.presentFamily) {
-            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;// 共享模式：并发
             createInfo.queueFamilyIndexCount = 2;
             createInfo.pQueueFamilyIndices = queueFamilyIndices;
         }
         else {
-            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;// 共享模式：独占，目前初始化流程完了以后是自动的选择的这种
             createInfo.queueFamilyIndexCount = 0; // Optional
             createInfo.pQueueFamilyIndices = nullptr; // Optional
         }
@@ -391,6 +449,107 @@ private:
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
         swapChainImages.resize(imageCount);
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+    }
+
+    void createImageViews() {
+        // 我们需要做的第一件事情需要定义保存图像视图集合的大小:
+        swapChainImageViews.resize(swapChainImages.size());
+        // 下一步，循环迭代所有的交换链图像
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            // 创建图像视图的参数被定义在VkImageViewCreateInfo结构体中。前几个参数的填充非常简单、直接
+            VkImageViewCreateInfo createInfo = {};
+            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image = swapChainImages[i];
+            // 其中viewType和format字段用于描述图像数据该被如何解释。viewType参数允许将图像定义为1D textures, 2D textures,3D textures 和cube maps
+            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            createInfo.format = swapChainImageFormat;
+            // components字段允许调整颜色通道的最终的映射逻辑。比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理。我们也可以将通道映射具体的常量数值0和1。在章节中我们使用默认的映射策略
+            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+            // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域。我们的图像将会作为color targets，没有任何mipmapping levels 或是多层 multiple layers
+            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            createInfo.subresourceRange.baseMipLevel = 0;
+            createInfo.subresourceRange.levelCount = 1;
+            createInfo.subresourceRange.baseArrayLayer = 0;
+            createInfo.subresourceRange.layerCount = 1;
+            // 如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要
+            
+            // 创建图像视图调用vkCreateImageView函数
+            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create image views!");
+            }
+
+            // 拥有了图像视图后，使用图像作为贴图已经足够了，但是它还没有准备好作为渲染的 target
+            // 它需要更多的间接步骤去准备，其中一个就是 framebuffer，被称作帧缓冲区。但首先我们要设置图形管线
+        }
+
+    }
+
+    // 在将代码传递给渲染管线之前，我们必须将其封装到VkShaderModule对象中。让我们创建一个辅助函数createShaderModule实现该逻辑
+    VkShaderModule createShaderModule(const std::vector<char>& code) {
+        // 创建shader module是比较简单的，我们仅仅需要指定二进制码缓冲区的指针和它的具体长度。这些信息被填充在VkShaderModuleCreateInfo结构体中。
+        // 需要留意的是字节码的大小是以字节指定的，但是字节码指针是一个uint32_t类型的指针，而不是一个char指针。所以我们使用reinterpret_cast进行转换指针。
+        // 如下所示，当需要转换时，还需要确保数据满足uint32_t的对齐要求。幸运的是，数据存储在std::vector中，默认分配器已经确保数据满足最差情况下的对齐要求
+        VkShaderModuleCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        createInfo.codeSize = code.size();
+
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+        // 调用vkCreateShaderMoudle创建VkShaderModule
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create shader module!");
+        }
+
+        // 参数与之前创建对象功能类似:逻辑设备，创建对象信息结构体的指针，自定义分配器和保存结果的句柄变量。在shader module创建完毕后，可以对二进制码的缓冲区进行立即的释放。最后不要忘记返回创建好的shader module
+        return shaderModule;
+    }
+
+    void createGraphicsPipeline() {
+        auto vertShaderCode = readFile("./sample01_vert.spv");
+        auto fragShaderCode = readFile("./sample01_frag.spv");
+
+        // shader module对象仅仅在渲染管线处理过程中需要，所以我们会在createGraphicsPipeline函数中定义本地变量保存它们，而不是定义类成员变量持有它们的句柄
+        VkShaderModule vertShaderModule;
+        VkShaderModule fragShaderModule;
+
+        // 调用加载shader module的辅助函数:
+        vertShaderModule = createShaderModule(vertShaderCode);
+        fragShaderModule = createShaderModule(fragShaderCode);
+
+        // 在图形管线创建完成且createGraphicsPipeline函数返回的时候，它们应该被清理掉，所以在该函数后删除它们
+        //vkDestroyShaderModule(device, fragShaderModule, nullptr);
+        //vkDestroyShaderModule(device, vertShaderModule, nullptr);
+
+        // VkShaderModule对象只是字节码缓冲区的一个包装容器。着色器并没有彼此链接，甚至没有给出目的。
+        // 通过VkPipelineShaderStageCreateInfo结构将着色器模块分配到管线中的顶点或者片段着色器阶段。
+        // VkPipelineShaderStageCreateInfo结构体是实际管线创建过程的一部分
+
+        // 我们首先在createGraphicsPipeline函数中填写顶点着色器结构体
+        VkPipelineShaderStageCreateInfo vertShaderStageInfo = {};
+        vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        // 除了强制的sType成员外，第一个需要告知Vulkan将在哪个流水线阶段使用着色器。在上一个章节的每个可编程阶段都有一个对应的枚举值
+        // 接下来的两个成员指定包含代码的着色器模块和调用的主函数。这意味着可以将多个片段着色器组合到单个着色器模块中，并使用不同的入口点来区分它们的行为。在这种情况下，我们坚持使用标准main函数作为入口
+        vertShaderStageInfo.module = vertShaderModule;
+        vertShaderStageInfo.pName = "main";
+
+        // 还有一个可选成员，pSpecializationInfo,在这里我们不会使用它，但是值得讨论一下。它允许为着色器指定常量值。
+        // 使用单个着色器模块，通过为其中使用不同的常量值，可以在流水线创建时对行为进行配置。
+        // 这比在渲染时使用变量配置着色器更有效率，因为编译器可以进行优化，例如消除if值判断的语句。如果没有这样的常量，可以将成员设置为nullptr，我们的struct结构体初始化自动进行
+
+        // 修改结构体满足片段着色器的需要
+        VkPipelineShaderStageCreateInfo fragShaderStageInfo = {};
+        fragShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragShaderStageInfo.module = fragShaderModule;
+        fragShaderStageInfo.pName = "main";
+
+        // 完成两个结构体的创建，并通过数组保存，这部分引用将会在实际的管线创建开始
+        VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
     }
 
     const std::vector<const char*> deviceExtensions = {
