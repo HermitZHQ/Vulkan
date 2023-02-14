@@ -142,14 +142,18 @@ private:
     // VK_KHR_surface扩展是一个instance级扩展，我们目前为止已经启用过它，它包含在glfwGetRequiredInstanceExtensions返回的列表中
     VkSurfaceKHR surface;// surface，和系统强相关的，所以这并不是vk的核心，而如果要进行显示的话，我们的交换链需要和surface打交道
 
+    // 可以在着色器中使用uniform，它是类似与动态状态变量的全局变量，可以在绘画时修改，可以更改着色器的行为而无需重新创建它们。它们通常用于将变换矩阵传递到顶点着色器或者在片段着色器冲创建纹理采样器。
+    // 这些uniform数值需要在管线创建过程中，通过VkPipelineLayout对象指定。即使在后续内容中用到，我们也仍然需要创建一个空的pipeline layout
+    VkPipelineLayout pipelineLayout;
+
     VkSwapchainKHR swapChain;// 现在添加一个类成员变量存储VkSwapchainKHR对象:
     // 交换链创建后，需要获取VkImage相关的句柄。它会在后续渲染的章节中引用。添加类成员变量存储该句柄:
     std::vector<VkImage> swapChainImages;// 图像被交换链创建，也会在交换链销毁的同时自动清理，所以我们不需要添加任何清理代码。
     // Vulkan 图像与视图，使用任何的VkImage，包括在交换链或者渲染管线中的，我们都需要创建VkImageView对象。
     // 从字面上理解它就是一个针对图像的视图或容器，通过它具体的渲染管线才能够读写渲染数据，换句话说VkImage不能与渲染管线进行交互
     std::vector<VkImageView> swapChainImageViews;
-    VkFormat swapChainImageFormat;
-    VkExtent2D swapChainExtent;
+    VkFormat swapChainImageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D swapChainExtent = { WIDTH, HEIGHT };// 这里需要设置，教程里面没有地方进行设置，就是0，0
 
     // 如果仅仅是为了测试交换链的有效性是远远不够的，因为它还不能很好的与窗体surface兼容。创建交换链同样也需要很多设置，所以我们需要了解一些有关设置的细节
     // 基本上有三大类属性需要设置:
@@ -163,6 +167,26 @@ private:
         std::vector<VkSurfaceFormatKHR> formats;
         std::vector<VkPresentModeKHR> presentModes;
     };
+
+    // 在render pass创建阶段我们指定了具体的附件，并通过VkFramebuffer对象包装绑定。帧缓冲区对象引用表示为附件的所有的VkImageView对象。
+    // 在我们的例子中只会使用一个帧缓冲区:color attachment。然而我们作为附件的图像依赖交换链用于呈现时返回的图像。这意味着我们必须为交换链中的所有图像创建一个帧缓冲区，并在绘制的时候使用对应的图像
+    std::vector<VkFramebuffer> swapChainFramebuffers;
+
+    VkPipeline graphicsPipeline;
+    // Vulkan 渲染通道，在我们完成管线的创建工作之前，我们需要告诉Vulkan渲染时候使用的framebuffer帧缓冲区附件相关信息。
+    // 我们需要指定多少个颜色和深度缓冲区将会被使用，指定多少个采样器被用到及在整个渲染操作中相关的内容如何处理。
+    // 所有的这些信息都被封装在一个叫做 render pass 的对象中
+    VkRenderPass renderPass;
+
+    VkCommandPool commandPool;
+    // 现在我们开始分配命令缓冲区并通过它们记录绘制指令。因为其中一个绘图命令需要正确绑定VkFrameBuffer，我们实际上需要为每一个交换链中的图像记录一个命令缓冲区。
+    // 最后创建一个VkCommandBuffer对象列表作为成员变量。命令缓冲区会在common pool销毁的时候自动释放系统资源，所以我们不需要明确编写cleanup逻辑
+    std::vector<VkCommandBuffer> commandBuffers;
+
+    // 信号量
+    // 在获得一个图像时，我们需要发出一个信号量准备进行渲染，另一个信号量的发出用于渲染结束，准备进行呈现presentation。创建两个成员变量存储信号量对象 :
+    VkSemaphore imageAvailableSemaphore;
+    VkSemaphore renderFinishedSemaphore;
 
     void initWindow() {
         glfwInit();
@@ -190,13 +214,154 @@ private:
         createSwapChain();
         // 创建图像视图
         createImageViews();
+        // 创建渲染通道
+        createRenderPass();
         // 创建图形管线
         createGraphicsPipeline();
+        // 创建帧缓冲
+        createFramebuffers();
+        // 创建命令缓冲
+        createCommandPool();
+        // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
+        createCommandBuffers();
+        // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
+        createSemaphores();
+
+        submitDrawCommands();
+    }
+
+    void submitDrawCommands() {
+
+        // flags标志位参数用于指定如何使用命令缓冲区。可选的参数类型如下:
+        // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: 命令缓冲区将在执行一次后立即重新记录。
+        // VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT : 这是一个辅助缓冲区，它限制在在一个渲染通道中。
+        // VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT : 命令缓冲区也可以重新提交，同时它也在等待执行。
+        // 我们使用了最后一个标志，因为我们可能已经在下一帧的时候安排了绘制命令，而最后一帧尚未完成。pInheritanceInfo参数与辅助缓冲区相关。它指定从主命令缓冲区继承的状态
+        for (size_t i = 0; i < commandBuffers.size(); i++) {
+            VkCommandBufferBeginInfo beginInfo = {};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+            beginInfo.pInheritanceInfo = nullptr; // Optional
+
+            vkBeginCommandBuffer(commandBuffers[i], &beginInfo);
+
+            // 启动渲染通道--------
+            // 绘制开始于调用vkCmdBeginRenderPass开启渲染通道。render pass使用VkRenderPassBeginInfo结构体填充配置信息作为调用时使用的参数
+            // 结构体第一个参数传递为绑定到对应附件的渲染通道本身。我们为每一个交换链的图像创建帧缓冲区，并指定为颜色附件
+            VkRenderPassBeginInfo renderPassInfo = {};
+            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            renderPassInfo.renderPass = renderPass;
+            renderPassInfo.framebuffer = swapChainFramebuffers[i];
+
+            // 后两个参数定义了渲染区域的大小。渲染区域定义着色器加载和存储将要发生的位置。区域外的像素将具有未定的值。为了最佳的性能它的尺寸应该与附件匹配
+            renderPassInfo.renderArea.offset = { 0, 0 };
+            renderPassInfo.renderArea.extent = swapChainExtent;
+
+            // 最后两个参数定义了用于VK_ATTACHMENT_LOAD_OP_CLEAR的清除值，我们将其用作颜色附件的加载操作。为了简化操作，我们定义了clear color为100%黑色
+            VkClearValue clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+            renderPassInfo.clearValueCount = 1;
+            renderPassInfo.pClearValues = &clearColor;
+
+            // 渲染通道现在可以启用。所有可以被记录的命令，被识别的前提是使用vkCmd前缀。它们全部返回void，所以在结束记录之前不会有任何错误处理。
+            // 对于每个命令，第一个参数总是记录该命令的命令缓冲区。
+            // 第二个参数指定我们传递的渲染通道的具体信息。最后的参数控制如何提供render pass将要应用的绘制命令。它使用以下数值任意一个 :
+            // VK_SUBPASS_CONTENTS_INLINE: 渲染过程命令被嵌入在主命令缓冲区中，没有辅助缓冲区执行。
+            // VK_SUBPASS_CONTENTS_SECONDARY_COOMAND_BUFFERS : 渲染通道命令将会从辅助命令缓冲区执行。
+            // 我们不会使用辅助命令缓冲区，所以我们选择第一个。
+            vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+            // 第二个参数指定具体管线类型，graphics or compute pipeline。
+            // 我们告诉Vulkan在图形管线中每一个操作如何执行及哪个附件将会在片段着色器中使用，所以剩下的就是告诉它绘制三角形
+            vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+            // 实际的vkCmdDraw函数有点与字面意思不一致，它是如此简单，仅因为我们提前指定所有渲染相关的信息。它有如下的参数需要指定，除了命令缓冲区:
+            // vertexCount: 即使我们没有顶点缓冲区，但是我们仍然有3个定点需要绘制。
+            // instanceCount: 用于instanced 渲染，如果没有使用请填1。
+            // firstVertex : 作为顶点缓冲区的偏移量，定义gl_VertexIndex的最小值。
+            // firstInstance : 作为instanced 渲染的偏移量，定义了gl_InstanceIndex的最小值。
+            vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
+            // render pass执行完绘制，可以结束渲染作业
+            vkCmdEndRenderPass(commandBuffers[i]);
+            // 并停止记录命令缓冲区的工作:
+            if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to record command buffer!");
+            }
+        }
+    }
+
+    void drawFrame() {
+        // 同步交换链事件有两种方法:栅栏和信号量。它们都是可以通过使用一个操作信号，负责协调操作的对象。另一个操作等待栅栏或者信号量从无信号状态转变到有信号状态
+        // 不同之处在于可以在应用程序中调用vkWaitForFence进入栅栏状态，而信号量不可以。
+        // 栅栏主要用于应用程序自身与渲染操作进行同步，而信号量用于在命令队列内或者跨命令队列同步操作。我们期望同步绘制与呈现的队列操作，所以使用信号量最合适
+
+        // 就像之前说到的，drawFrame函数需要做的第一件事情就是从交换链中获取图像。回想一下交换链是一个扩展功能，所以我们必须使用具有vk* KHR命名约定的函数:
+        // vkAcquireNextImageKHR函数前两个参数是我们希望获取到图像的逻辑设备和交换链。第三个参数指定获取有效图像的操作timeout，单位纳秒。我们使用64位无符号最大值禁止timeout
+        // 
+        // 接下来的两个参数指定使用的同步对象，当presentation引擎完成了图像的呈现后会使用该对象发起信号。这就是开始绘制的时间点。它可以指定一个信号量semaphore或者栅栏或者两者。出于目的性，我们会使用imageAvailableSemaphore
+        // 最后的参数指定交换链中成为available状态的图像对应的索引。其中索引会引用交换链图像数组swapChainImages的图像VkImage。我们使用这个索引选择正确的命令缓冲区
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(device, swapChain, std::numeric_limits<uint64_t>::max(), imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        // 提交命令缓冲区
+        // 队列提交和同步通过VkSubmitInfo结构体进行参数配置。
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        // 前三个参数指定在执行开始之前要等待的哪个信号量及要等待的通道的哪个阶段。
+        // 为了向图像写入颜色，我们会等待图像状态变为available，所我们指定写入颜色附件的图形管线阶段。
+        // 理论上这意味着，具体的顶点着色器开始执行，而图像不可用。waitStages数组对应pWaitSemaphores中具有相同索引的信号量
+        VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+        // 接下来的两个参数指定哪个命令缓冲区被实际提交执行。如初期提到的，我们应该提交命令缓冲区，它将我们刚获取的交换链图像做为颜色附件进行绑定。
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffers[imageIndex];
+
+        // ------结束信号
+        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+        // signalSemaphoreCount和pSignalSemaphores参数指定了当命令缓冲区执行结束向哪些信号量发出信号。根据我们的需要使用renderFinishedSemaphore
+        // 使用vkQueueSubmit函数向图像队列提交命令缓冲区。当开销负载比较大的时候，处于效率考虑，函数可以持有VkSubmitInfo结构体数组。
+        // 最后一个参数引用了一个可选的栅栏，当命令缓冲区执行完毕时候它会被发送信号。我们使用信号量进行同步，所以我们需要传递VK_NULL_HANDLE
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
+            throw std::runtime_error("failed to submit draw command buffer!");
+        }
+
+        // ------呈现
+        // 绘制帧最后一个步骤是将结果提交到交换链，使其最终显示在屏幕上。Presentation通过VkPresentInfoKHR结构体配置，具体位置在drawFrame函数最后。
+        VkPresentInfoKHR presentInfo = {};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        // 前两个参数指定在进行presentation之前要等待的信号量，就像VkSubmitInfo一样。
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = signalSemaphores;
+        // 接下来的两个参数指定用于提交图像的交换链和每个交换链图像索引。大多数情况下仅一个。
+        VkSwapchainKHR swapChains[] = { swapChain };
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = swapChains;
+        presentInfo.pImageIndices = &imageIndex;
+        // 最后一个可选参数pResults，它允许指定一组VkResult值，以便在presentation成功时检查每个独立的交换链。如果只使用单个交换链，则不需要，因为可以简单的使用当前函数的返回值
+        presentInfo.pResults = nullptr; // Optional
+        // vkQueuePresentKHR函数提交请求呈现交换链中的图像。我们在下一个章节为vkAcquireNextImageKHR和vkQueuePresentKHR可以添加错误处理。
+        // 因为它们失败并不一定意味着程序应该终止，与我们迄今为止看到的功能不同。
+        // 如果一切顺利，当再次运行程序时候，应该可以看到一下内容（也就是三角形绘制出来了）
+        // 当时最后画面出来前，我还调试了很久，光看validation的信息其实不够，有些虽然有error，但是并不影响显示，首先我们可以调试的是clearcolor有没有生效，有的话
+        // 第二步才是三角形，三角形当时因为没有修改shader，所以绘制是黑色，和clearcolor一样，我就以为出问题了，结果都已经画上了
+        // 这下大概对vk的绘制精华有一定总结了，主要的绘制还是在submitDrawCommands和drawFrame里面，涉及到绘制信号同步，已经绘制命令的发送方式！！
+        vkQueuePresentKHR(presentQueue, &presentInfo);
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+
+            // drawFrame函数将会执行如下操作:
+            // 从交换链中获取一个图像
+            // 在帧缓冲区中，使用作为附件的图像来执行命令缓冲区中的命令
+            // 为了最终呈现，将图像返还到交换链
+            // 每个事件派发都有一个函数调用来对应，但它们的执行是异步的。函数调用将在操作实际完成之前返回，并且执行顺序也是未定义的。这是不理想的，因为每一个操作都取决于前一个操作
+            drawFrame();
         }
     }
 
@@ -206,8 +371,26 @@ private:
             vkDestroyImageView(device, swapChainImageViews[i], nullptr);
         }
 
+        // 删除帧缓冲区
+        for (size_t i = 0; i < swapChainFramebuffers.size(); i++) {
+            vkDestroyFramebuffer(device, swapChainFramebuffers[i], nullptr);
+        }
+        // 删除图形管线
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        // 删除管线布局
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        // 删除渲染通道
+        vkDestroyRenderPass(device, renderPass, nullptr);
+
         vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroySwapchainKHR(device, swapChain, nullptr);
+
+        // 删除命令池
+        vkDestroyCommandPool(device, commandPool, nullptr);
+
+        // 删除信号量
+        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
 
         // device和实例都在后面摧毁，因为前面还有些资源的释放需要用到他们，比如swapchain
         vkDestroyDevice(device, nullptr);
@@ -343,8 +526,6 @@ private:
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
-//         createInfo.pQueueCreateInfos = &queueCreateInfo;
-//         createInfo.queueCreateInfoCount = 1;
         // 动态创建2个队列簇，一个是graphics的，一个是present的
         createInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
@@ -508,6 +689,102 @@ private:
         return shaderModule;
     }
 
+    void createRenderPass() {
+        // 在我们的例子中，我们将只有一个颜色缓冲区附件，它由交换链中的一个图像所表示
+        // format是颜色附件的格式，它应该与交换链中图像的格式相匹配，同时我们不会做任何多重采样的工作，所以采样器设置为1
+        VkAttachmentDescription colorAttachment = {};
+        colorAttachment.format = swapChainImageFormat;
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+
+        // loadOp和storeOp决定了渲染前和渲染后数据在对应附件的操作行为。对于 loadOp 我们有如下选项
+        // VK_ATTACHMENT_LOAD_OP_LOAD: 保存已经存在于当前附件的内容
+        // VK_ATTACHMENT_LOAD_OP_CLEAR: 起始阶段以一个常量清理附件内容
+        // VK_ATTACHMENT_LOAD_OP_DONT_CARE : 存在的内容未定义，忽略它们
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        // 在绘制新的一帧内容之前，我们要做的是使用清理操作来清理帧缓冲区framebuffer为黑色。同时对于 storeOp 仅有两个选项
+        // VK_ATTACHMENT_STORE_OP_STORE: 渲染的内容会存储在内存，并在之后进行读取操作
+        // VK_ATTACHMENT_STORE_OP_DONT_CARE : 帧缓冲区的内容在渲染操作完毕后设置为undefined
+        // 我们要做的是渲染一个三角形在屏幕上，所以我们选择存储操作
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        // loadOp和storeOp应用在颜色和深度数据，同时stencilLoadOp / stencilStoreOp应用在模版数据。
+        // 我们的应用程序不会做任何模版缓冲区的操作，所以它的loading和storing无关紧要
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+        // 纹理和帧缓冲区在Vulkan中通常用VkImage 对象配以某种像素格式来代表。但是像素在内存中的布局可以基于需要对image图像进行的操作发生内存布局的变化
+        // 一些常用的布局:
+        // VK_IMAGE_LAYOUT_COLOR_ATTACHMET_OPTIMAL: 图像作为颜色附件
+        // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : 图像在交换链中被呈现
+        // VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : 图像作为目标，用于内存COPY操作
+        // 我们会深入讨论这些内容在纹理章节，现在最重要的是为需要转变的图像指定合适的layout布局进行操作
+        // initialLayout指定图像在开始进入渲染通道render pass前将要使用的布局结构。finalLayout指定当渲染通道结束自动变换时使用的布局。
+        // 使用VK_IMAGE_LAYOUT_UNDEFINED设置initialLayout，意为不关心图像之前的布局。特殊值表明图像的内容不确定会被保留，但是这并不总要，因为无论如何我们都要清理它。
+        // 我们希望图像渲染完毕后使用交换链进行呈现，这就解释了为什么finalLayout要设置为VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+        //colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        // 子通道和附件引用
+        // 一个单独的渲染通道可以由多个子通道组成。子通道是渲染操作的一个序列。子通道作用与后续的渲染操作，并依赖之前渲染通道输出到帧缓冲区的内容。
+        // 比如说后处理效果的序列通常每一步都依赖之前的操作。
+        // 如果将这些渲染操作分组到一个渲染通道中，通过Vulkan将通道中的渲染操作进行重排序，可以节省内存从而获得更好的性能。对于我们要绘制的三角形，我们只需要一个子通道
+        // 每个子通道引用一个或者多个之前使用结构体描述的附件。这些引用本身就是VkAttachmentReference结构体
+
+        // attachment附件参数通过附件描述符集合中的索引来持有。我们的集合是由一个VkAttachmentDesription组成的，所以它的索引为0。layout为附件指定子通道在持有引用时候的layout。
+        // 当子通道开始的时候Vulkan会自动转变附件到这个layout。因为我们期望附件起到颜色缓冲区的作用，layout设置为VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL会给我们最好的性能
+        VkAttachmentReference colorAttachmentRef = {};
+        colorAttachmentRef.attachment = 0;
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        // 子通道使用VkSubpassDescription结构体描述
+        VkSubpassDescription subpass = {};
+        //  Vulkan在未来可能会支持关于compute subpasses的功能，所以在这里我们明确指定graphics subpass图形子通道。下一步为它指定颜色附件的引用
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorAttachmentRef;
+        // 附件在数组中的索引直接从片段着色器引用，其layout(location = 0) out vec4 outColor 指令
+        // 可以被子通道引用的附件类型如下:
+        // pInputAttachments: 附件从着色器中读取
+        // pResolveAttachments : 附件用于颜色附件的多重采样
+        // pDepthStencilAttachment : 附件用于深度和模版数据
+        // pPreserveAttachments : 附件不被子通道使用，但是数据被保存
+
+        // 渲染通道对象创建通过填充VkRenderPassCreateInfo结构体，并配合相关附件和子通道来完成。VkAttachmentReference对象引用附件数组
+        VkRenderPassCreateInfo renderPassInfo = {};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+
+        // Subpass 依赖性
+        // 请记住，渲染通道中的子通道会自动处理布局的变换。这些变换通过子通道的依赖关系进行控制，它们指定了彼此之间内存和执行的依赖关系。现在只有一个子通道，但是在此子通道之前和之后的操作也被视为隐式“子通道”。
+        // 有两个内置的依赖关系在渲染通道开始和渲染通道结束处理转换，但是前者不会在当下发生。
+        // 假设转换发生在管线的起始阶段，但是我们还没有获取图像！有两个方法处理这个问题可以将imageAvailableSemaphore的waitStages更改为VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT，确保图像有效之前渲染通道不会开始
+        // 或者我们让渲染通道等待VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT阶段。我觉得使用第二个选项，因为可以比较全面的了解subpass依赖关系及其工作方式。
+        // 子通道依赖关系可以通过VkSubpassDependency结构体指定，在createRenderPass函数中添加 :
+
+        // 前两个参数指定依赖的关系和从属子通道的索引。特殊值VK_SUBPASS_EXTERNAL是指在渲染通道之前或者之后的隐式子通道，取决于它是否在srcSubpass或者dstSubPass中指定。
+        // 索引0指定我们的子通道，这是第一个也是唯一的。dstSubpass必须始终高于srcSubPass以防止依赖关系出现循环
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        // 接下来的两个参数字段指定要等待的操作和这些操作发生的阶段。在我们可以访问对象之前，我们需要等待交换链完成对应图像的读取操作。这可以通过等待颜色附件输出的阶段来实现。
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        // 在颜色附件阶段的操作及涉及颜色附件的读取和写入的操作应该等待。这些设置将阻止转换发生，直到实际需要(并允许):当我们需要写入颜色时候。
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        // VkRenderPassCreateInfo结构体有两个字段指定依赖的数组。
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
+
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create render pass!");
+        }
+    }
+
     void createGraphicsPipeline() {
         auto vertShaderCode = readFile("./sample01_vert.spv");
         auto fragShaderCode = readFile("./sample01_frag.spv");
@@ -550,6 +827,337 @@ private:
 
         // 完成两个结构体的创建，并通过数组保存，这部分引用将会在实际的管线创建开始
         VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+
+        // 固有管线包含以下设置------
+        // Vulkan 固有功能，早起的图形API在图形渲染管线的许多阶段提供了默认的状态。在Vulkan中，从viewport的大小到混色函数，需要凡事做到亲历亲为
+        // 1.顶点输入
+        // 2.输入组件
+        // 3.视口和剪裁
+        // 4.光栅化
+        // 5.重采样
+        // 6.深度和模版测试
+        // 7.颜色混合
+        // 8.动态修改
+        // 9.管道布局
+
+        // 顶点输入------
+        // VkPipelineVertexInputStateCreateInfo结构体描述了顶点数据的格式，该结构体数据传递到vertex shader中。它以两种方式进行描述 :
+        // Bindings:根据数据的间隙，确定数据是每个顶点或者是每个instance(instancing)
+        // Attribute 描述 : 描述将要进行绑定及加载属性的顶点着色器中的相关属性类型。
+        // 因为我们将顶点数据硬编码到vertex shader中，所以我们将要填充的结构体没有顶点数据去加载。我们将会在vertex buffer章节中回来操作
+        VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInputInfo.vertexBindingDescriptionCount = 0;
+        vertexInputInfo.pVertexBindingDescriptions = nullptr; // Optional
+        vertexInputInfo.vertexAttributeDescriptionCount = 0;
+        vertexInputInfo.pVertexAttributeDescriptions = nullptr; // Optional
+        // pVertexBindingDescriptions和pVertexAttributeDescriptions成员指向结构体数组，用于进一步描述加载的顶点数据信息。在createGraphicsPipeline函数中的shaderStages数组后添加该结构体????
+
+        // 输入组件------
+        // VkPipelineInputAssemblyStateCreateInfo结构体描述两件事情:顶点数据以什么类型的几何图元拓扑进行绘制及是否启用顶点索重新开始图元。图元的拓扑结构类型topology枚举值如下
+        // VK_PRIMITIVE_TOPOLOGY_POINT_LIST: 顶点到点
+        // VK_PRIMITIVE_TOPOLOGY_LINE_LIST : 两点成线，顶点不共用
+        // VK_PRIMITIVE_TOPOLOGY_LINE_STRIP : 两点成线，每个线段的结束顶点作为下一个线段的开始顶点
+        // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : 三点成面，顶点不共用
+        // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : 每个三角形的第二个、第三个顶点都作为下一个三角形的前两个顶点
+
+        // 正常情况下，顶点数据按照缓冲区中的序列作为索引，但是也可以通过element buffer缓冲区自行指定顶点数据的索引。通过复用顶点数据提升性能。
+        // 如果设置primitiveRestartEnable成员为VK_TRUE，可以通过0xFFFF或者0xFFFFFFFF作为特殊索引来分解线和三角形在_STRIP模式下的图元拓扑结构（这个应该是个什么特殊用法，感觉暂时不用太关注）
+
+        // 通过本教程绘制三角形，所以我们坚持按照如下格式填充数据结构
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        // 视口和裁剪------
+        // Viewport用于描述framebuffer作为渲染输出结果目标区域。它的数值在本教程中总是设置在(0, 0)和(width, height)
+        // 记得交换链和它的images图像大小WIDTH和HEIGHT会根据不同的窗体而不同。交换链图像将会在帧缓冲区framebuffers使用，所以我们应该坚持它们的大小
+        // minDepth和maxDepth数值指定framebuffer中深度的范围。这些数值必须收敛在[0.0f, 1.0f]区间冲，但是minDepth可能会大于maxDepth。如果你不做任何指定，建议使用标准的数值0.0f和1.0f
+        // viewports定义了image图像到framebuffer帧缓冲区的转换关系，裁剪矩形定义了哪些区域的像素被存储。任何在裁剪巨型外的像素都会在光栅化阶段丢弃
+        VkViewport viewport = {};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = (float)swapChainExtent.width;
+        viewport.height = (float)swapChainExtent.height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        // 在本教程中我们需要将图像绘制到完整的帧缓冲区framebuffer中，所以我们定义裁剪矩形覆盖到整体图像
+        VkRect2D scissor = {};
+        scissor.offset = { 0, 0 };
+        scissor.extent = swapChainExtent;
+        // viewport和裁剪矩形需要借助VkPipelineViewportStateCreateInfo结构体联合使用。可以使用多viewports和裁剪矩形在一些图形卡，通过数组引用。使用该特性需要GPU支持该功能，具体看逻辑设备的创建
+        VkPipelineViewportStateCreateInfo viewportState = {};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.pViewports = &viewport;
+        viewportState.scissorCount = 1;
+        viewportState.pScissors = &scissor;
+
+        // 光栅化------
+        // 光栅化通过顶点着色器及具体的几何算法将顶点进行塑形，并将图形传递到片段着色器进行着色工作。
+        // 它也会执行深度测试depth testing、面裁切face culling和裁剪测试，它可以对输出的片元进行配置，决定是否输出整个图元拓扑或者是边框(线框渲染)。
+        // 所有的配置通过VkPipelineRasterizationStateCreateInfo结构体定义
+        VkPipelineRasterizationStateCreateInfo rasterizer = {};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        // 它的depthClampEnable设置为VK_TRUE，超过远近裁剪面的片元会进行收敛，而不是丢弃它们。它在特殊的情况下比较有用，像阴影贴图。使用该功能需要得到GPU的支持
+        rasterizer.depthClampEnable = VK_FALSE;
+        // 如果rasterizerDiscardEnable设置为VK_TRUE，那么几何图元永远不会传递到光栅化阶段。这是基本的禁止任何输出到framebuffer帧缓冲区的方法
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;
+        // polygonMode决定几何产生图片的内容。下列有效模式:
+        // VK_POLYGON_MODE_FILL: 多边形区域填充
+        // VK_POLYGON_MODE_LINE : 多边形边缘线框绘制
+        // VK_POLYGON_MODE_POINT : 多边形顶点作为描点绘制
+        // 使用任何模式填充需要开启GPU功能
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        // lineWidth成员是直接填充的，根据片元的数量描述线的宽度。最大的线宽支持取决于硬件，任何大于1.0的线宽需要开启GPU的wideLines特性支持
+        rasterizer.lineWidth = 1.0f;
+        // cullMode变量用于决定面裁剪的类型方式。可以禁止culling，裁剪front faces，cull back faces 或者全部。
+        // frontFace用于描述作为front-facing面的顶点的顺序，可以是顺时针也可以是逆时针
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        // 光栅化可以通过添加常量或者基于片元的斜率来更改深度值。一些时候对于阴影贴图是有用的，但是我们不会在章节中使用，设置depthBiasEnable为VK_FALSE
+        rasterizer.depthBiasEnable = VK_FALSE;
+        rasterizer.depthBiasConstantFactor = 0.0f; // Optional
+        rasterizer.depthBiasClamp = 0.0f; // Optional
+        rasterizer.depthBiasSlopeFactor = 0.0f; // Optional
+
+        // 重采样------
+        // VkPipelineMultisampleStateCreateInfo结构体用于配置多重采样。所谓多重采样是抗锯齿anti-aliasing的一种实现。
+        // 它通过组合多个多边形的片段着色器结果，光栅化到同一个像素。这主要发生在边缘，这也是最引人注目的锯齿出现的地方。
+        // 如果只有一个多边形映射到像素是不需要多次运行片段着色器进行采样的，相比高分辨率来说，它会花费较低的开销。开启该功能需要GPU支持
+        VkPipelineMultisampleStateCreateInfo multisampling = {};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = VK_FALSE;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisampling.minSampleShading = 1.0f; // Optional
+        multisampling.pSampleMask = nullptr; // Optional
+        multisampling.alphaToCoverageEnable = VK_FALSE; // Optional
+        multisampling.alphaToOneEnable = VK_FALSE; // Optional
+        // 在本教程中我们不会使用多重采样，但是可以随意的尝试，具体的参数请参阅规范
+
+        // 深度和模板测试------
+        // 如果使用depth 或者 stencil缓冲区，需要使用VkPipelineDepthStencilStateCreateInfo配置。我们现在不需要使用，所以简单的传递nullptr，关于这部分会专门在深度缓冲区章节中讨论
+        // 下面的参数是我自己尝试性添加的
+        VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.stencilTestEnable = VK_FALSE;
+        depthStencil.depthTestEnable = VK_FALSE;
+        depthStencil.pNext = nullptr;
+
+        // 颜色混合------
+        // 片段着色器输出具体的颜色，它需要与帧缓冲区framebuffer中已经存在的颜色进行混合。这个转换的过程成为混色，它有两种方式:
+
+        // 将old和new颜色进行混合产出一个最终的颜色
+        // 使用按位操作混合old和new颜色的值
+        // 有两个结构体用于配置颜色混合。第一个结构体VkPipelineColorBlendAttachmentState包括了每个附加到帧缓冲区的配置。第二个结构体VkPipelineColorBlendStateCreateInfo包含了全局混色的设置。在我们的例子中仅使用第一种方式
+        VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
+        colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorBlendAttachment.blendEnable = VK_FALSE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD; // Optional
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE; // Optional
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; // Optional
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD; // Optional
+        /*这种针对每个帧缓冲区配置混色的方式，使用如下伪代码进行说明:
+        if (blendEnable) {
+            finalColor.rgb = (srcColorBlendFactor * newColor.rgb) < colorBlendOp > (dstColorBlendFactor * oldColor.rgb);
+            finalColor.a = (srcAlphaBlendFactor * newColor.a) < alphaBlendOp > (dstAlphaBlendFactor * oldColor.a);
+        }
+        else {
+            finalColor = newColor;
+        }
+
+        finalColor = finalColor & colorWriteMask;
+        如果blendEnable设置为VK_FALSE, 那么从片段着色器输出的新颜色不会发生变化，否则两个混色操作会计算新的颜色。所得到的结果与colorWriteMask进行AND运算，以确定实际传递的通道。
+
+            大多数的情况下使用混色用于实现alpha blending，新的颜色与旧的颜色进行混合会基于它们的opacity透明通道。finalColor作为最终的输出 :
+
+        finalColor.rgb = newAlpha * newColor + (1 - newAlpha) * oldColor;
+        finalColor.a = newAlpha.a;
+        可以通过一下参数完成:
+
+        colorBlendAttachment.blendEnable = VK_TRUE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+        可以在规范中找到所有有关VkBlendFactor和VkBlendOp的枚举值。
+
+            第二个结构体持有所有帧缓冲区的引用，它允许设置混合操作的常量，该常量可以作为后续计算的混合因子 :
+
+        VkPipelineColorBlendStateCreateInfo colorBlending = {};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.logicOp = VK_LOGIC_OP_COPY; // Optional
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+        colorBlending.blendConstants[0] = 0.0f; // Optional
+        colorBlending.blendConstants[1] = 0.0f; // Optional
+        colorBlending.blendConstants[2] = 0.0f; // Optional
+        colorBlending.blendConstants[3] = 0.0f; // Optional
+        如果需要使用第二种方式设置混合操作(bitwise combination), 需要设置logicOpEnable为VK_TURE。二进制位操作在logicOp字段中指定。在第一种方式中会自动禁止，等同于为每一个附加的帧缓冲区framebuffer关闭混合操作，blendEnable为VK_FALSE。colorWriteMask掩码会用确定帧缓冲区中具体哪个通道的颜色受到影响。它也可以在两种方式下禁止，截至目前，片段缓冲区向帧缓冲区中输出的颜色不会进行任何变化
+        */
+        VkPipelineColorBlendStateCreateInfo colorBlending = {};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.logicOp = VK_LOGIC_OP_COPY; // Optional
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+        colorBlending.blendConstants[0] = 0.0f; // Optional
+        colorBlending.blendConstants[1] = 0.0f; // Optional
+        colorBlending.blendConstants[2] = 0.0f; // Optional
+        colorBlending.blendConstants[3] = 0.0f; // Optional
+
+        // 动态修改------
+        // 之前创建的一些结构体的状态可以在运行时动态修改，而不必重新创建。比如viewport的大小, line width和blend constants。如果需要进行这样的操作，需要填充VkPipelineDynamicStateCreateInfo结构体
+        // 下面是示例代码，我这里是不需要马上进行动态修改的，所以先注释掉
+        /*
+        VkDynamicState dynamicStates[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_LINE_WIDTH
+        };
+
+        VkPipelineDynamicStateCreateInfo dynamicState = {};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = 2;
+        dynamicState.pDynamicStates = dynamicStates;
+        */
+
+        // 管道布局------
+        // 该结构体还指定了push常量，这是将动态值传递给着色器的另一个方式。pipeline layout可以在整个程序的生命周期内引用，所以它在程序退出的时候进行销毁
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 0; // Optional
+        pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+        pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
+        pipelineLayoutInfo.pPushConstantRanges = 0; // Optional
+
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create pipeline layout!");
+        }
+
+        // 然而，在我们可以最终创建图形管线之前，还有一个对象需要创建，它就是render pass------
+        VkGraphicsPipelineCreateInfo pipelineInfo = {};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipelineInfo.stageCount = 2;
+        pipelineInfo.pStages = shaderStages;
+
+        // 现在开始引用之前的VkPipelineShaderStageCreateInfo结构体数组
+        pipelineInfo.pVertexInputState = &vertexInputInfo;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = nullptr; // Optional
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDynamicState = nullptr; // Optional
+
+        pipelineInfo.layout = pipelineLayout;
+
+        // 最后我们需要引用render pass和图形管线将要使用的子通道sub pass的索引
+        pipelineInfo.renderPass = renderPass;
+        pipelineInfo.subpass = 0;
+
+        // 实际上还有两个参数:basePipelineHandle 和 basePipelineIndex。Vulkan允许您通过已经存在的管线创建新的图形管线。
+        // 这种衍生出新管线的想法在于，当要创建的管线与现有管道功能相同时，获得较低的开销，同时也可以更快的完成管线切换，当它们来自同一个父管线。
+        // 可以通过basePipelineHandle指定现有管线的句柄，也可以引用由basePipelineIndex所以创建的另一个管线。目前只有一个管线，所以我们只需要指定一个空句柄和一个无效的索引。
+        // 只有在VkGraphicsPipelineCreateInfo的flags字段中也指定了VK_PIPELINE_CREATE_DERIVATIVE_BIT标志时，才需要使用这些值
+        pipelineInfo.basePipelineHandle = VK_NULL_HANDLE; // Optional
+        pipelineInfo.basePipelineIndex = -1; // Optional
+
+        // vkCreateGraphicsPipelines函数在Vulkan中比起一般的创建对象函数需要更多的参数。它可以用来传递多个VkGraphicsPipelineCreateInfo对象并创建多个VkPipeline对象。
+        // 我们传递VK_NULL_HANDLE参数作为第二个参数，作为可选VkPipelineCache对象的引用。
+        // 管线缓存可以用于存储和复用与通过多次调用vkCreateGraphicsPipelines函数相关的数据，甚至在程序执行的时候缓存到一个文件中。这样可以加速后续的管线创建逻辑。具体的内容我们会在管线缓存章节介绍
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create graphics pipeline!");
+        }
+
+        // 现在运行程序，确认所有工作正常，并创建图形管线成功！我们已经无比接近在屏幕上绘制出东西来了。在接下来的几个章节中，我们将从交换链图像中设置实际的帧缓冲区，并准备绘制命令
+    }
+
+    void createFramebuffers() {
+        swapChainFramebuffers.resize(swapChainImageViews.size());
+
+        // 我们接下来迭代左右的图像视图并通过它们创建对应的framebuffers
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            VkImageView attachments[] = {
+                swapChainImageViews[i]
+            };
+
+            // 如你所见，创建framebuffers是非常直接的。首先需要指定framebuffer需要兼容的renderPass。我们只能使用与其兼容的渲染通道的帧缓冲区，这大体上意味着它们使用相同的附件数量和类型
+            // attachmentCount和pAttachments参数指定在渲染通道的pAttachment数组中绑定到相应的附件描述的VkImageView对象。
+            // width和height参数是容易理解的，layer是指定图像数组中的层数。我们的交换链图像是单个图像，因此层数为1
+            VkFramebufferCreateInfo framebufferInfo = {};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebufferInfo.renderPass = renderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.width = swapChainExtent.width;
+            framebufferInfo.height = swapChainExtent.height;
+            framebufferInfo.layers = 1;
+
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &swapChainFramebuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create framebuffer!");
+            }
+        }
+    }
+
+    void createCommandPool() {
+        QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+
+        // 有两个标志位用于command pools:
+        // VK_COMMAND_POOL_CREATE_TRANSIENT_BIT: 提示命令缓冲区非常频繁的重新记录新命令(可能会改变内存分配行为)
+        // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT : 允许命令缓冲区单独重新记录，没有这个标志，所有的命令缓冲区都必须一起重置
+        // 我们仅仅在程序开始的时候记录命令缓冲区，并在主循环体main loop中多次执行，因此我们不会使用这些标志。
+
+        VkCommandPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily.value();
+        poolInfo.flags = 0; // Optional
+        // 命令缓冲区通过将其提交到其中一个设备队列上来执行，如我们检索的graphics和presentation队列。
+        // 每个命令对象池只能分配在单一类型的队列上提交的命令缓冲区，换句话说要分配的命令需要与队列类型一致。我们要记录绘制的命令，这就说明为什么要选择图形队列簇的原因
+
+        // 通过vkCreateCommandPool函数完成command pool创建工作。它不需要任何特殊的参数设置。命令将被整个程序的生命周期使用以完成屏幕的绘制工作，所以对象池应该被在最后销毁:
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create command pool!");
+        }
+    }
+
+    void createCommandBuffers() {
+        commandBuffers.resize(swapChainFramebuffers.size());
+
+        // level参数指定分配的命令缓冲区的主从关系。
+        // VK_COMMAND_BUFFER_LEVEL_PRIMARY: 可以提交到队列执行，但不能从其他的命令缓冲区调用。
+        // VK_COMMAND_BUFFER_LEVEL_SECONDARY : 无法直接提交，但是可以从主命令缓冲区调用。
+        // 我们不会在这里使用辅助缓冲区功能，但是可以想像，对于复用主缓冲区的常用操作很有帮助
+        VkCommandBufferAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
+
+        if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate command buffers!");
+        }
+    }
+
+    void createSemaphores() {
+        // 创建信号量对象需要填充VkSemaphoreCreateInfo结构体，但是在当前版本的API中，实际上不需要填充任何字段，除sType:
+        VkSemaphoreCreateInfo semaphoreInfo = {};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        // Vulkan API未来版本或者扩展中或许会为flags和pNext参数增加功能选项。创建信号量对象的过程很熟悉了，在这里使用vkCreateSemaphore:
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS) {
+
+            throw std::runtime_error("failed to create semaphores!");
+        }
+
+        // 在程序结束时，当所有命令完成并不需要同步时，应该清除信号量，在cleanup中执行
     }
 
     const std::vector<const char*> deviceExtensions = {
@@ -718,7 +1326,9 @@ private:
 
             VkBool32 presentSupport = false;
             vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface, &presentSupport);
-            if (queueFamily.queueCount > 0 && presentSupport) {
+            if (queueFamily.queueCount > 0 && presentSupport 
+                && indices.graphicsFamily != i/*这里是我自己加的，突然冒出来个不是unique的错误，没太明白*/) 
+            {
                 indices.presentFamily = i;
             }
 

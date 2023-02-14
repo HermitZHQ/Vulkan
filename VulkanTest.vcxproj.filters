@@ -18,5 +18,8 @@
     <ClCompile Include="VulkanTest.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="main-triangle-fini01.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
