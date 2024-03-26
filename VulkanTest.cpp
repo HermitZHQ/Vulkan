@@ -79,10 +79,16 @@ struct Vertex {
     }
 };
 
+// 之前尝试了非index的draw，我们添加的3个点没有画出来，是因为旋转的顺序不对，如果不采用index的情况（一般不可能，都是会用index，我这里只是记录我当时没画出来的问题），要注意新加3个点的旋转（需要顺时针）
 const std::vector<Vertex> vertices = {
-    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}},
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
 };
 
 static std::vector<char> readFile(const std::string& filename) {
@@ -226,6 +232,9 @@ private:
     VkBuffer vertexBuffer;
     // 具体给顶点缓冲绑定的内存
     VkDeviceMemory vertexBufferMemory;
+    // 索引缓冲和上面类似
+    VkBuffer indexBuffer;
+    VkDeviceMemory indexBufferMemory;
 
 
     VkPipeline graphicsPipeline;
@@ -280,6 +289,8 @@ private:
         createCommandPool();
         // 创建顶点缓冲（之前shader硬编码画三角形不是常规方式），因为内部会用到命令缓冲，所以必须放在命令池的创建之后！
         createVertexBuffer();
+        // 创建索引缓冲
+        createIndexBuffer();
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
         createCommandBuffers();
         // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
@@ -360,6 +371,30 @@ private:
 
         // 使用分段缓存进行copy，最终会使用cmd queue将buffer拷贝到local device中
         copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        // 最后别忘了释放相关资源。。。。（真是很麻烦啊，什么都要自己控制）
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createIndexBuffer() {
+
+        // 创建索引缓冲的过程基本和顶点缓冲一致
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, indices.data(), (size_t)bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+
+        // 使用分段缓存进行copy，最终会使用cmd queue将buffer拷贝到local device中
+        copyBuffer(stagingBuffer, indexBuffer, bufferSize);
 
         // 最后别忘了释放相关资源。。。。（真是很麻烦啊，什么都要自己控制）
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -454,12 +489,16 @@ private:
             VkDeviceSize offsets[] = { 0 };
             vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
 
+            // 绑定索引缓冲
+            vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
             // 实际的vkCmdDraw函数有点与字面意思不一致，它是如此简单，仅因为我们提前指定所有渲染相关的信息。它有如下的参数需要指定，除了命令缓冲区:
             // vertexCount: 即使我们没有顶点缓冲区，但是我们仍然有3个定点需要绘制。
             // instanceCount: 用于instanced 渲染，如果没有使用请填1。
             // firstVertex : 作为顶点缓冲区的偏移量，定义gl_VertexIndex的最小值。
             // firstInstance : 作为instanced 渲染的偏移量，定义了gl_InstanceIndex的最小值。
-            vkCmdDraw(commandBuffers[i], vertices.size(), 1, 0, 0);
+            //vkCmdDraw(commandBuffers[i], vertices.size(), 1, 0, 0);
+            vkCmdDrawIndexed(commandBuffers[i], indices.size(), 1, 0, 0, 0);
             // render pass执行完绘制，可以结束渲染作业
             vkCmdEndRenderPass(commandBuffers[i]);
             // 并停止记录命令缓冲区的工作:
@@ -592,6 +631,8 @@ private:
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         // 释放配套内存
         vkFreeMemory(device, vertexBufferMemory, nullptr);
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        vkFreeMemory(device, indexBufferMemory, nullptr);
 
         // 删除命令池
         vkDestroyCommandPool(device, commandPool, nullptr);
