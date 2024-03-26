@@ -354,6 +354,11 @@ private:
         // 第二步才是三角形，三角形当时因为没有修改shader，所以绘制是黑色，和clearcolor一样，我就以为出问题了，结果都已经画上了
         // 这下大概对vk的绘制精华有一定总结了，主要的绘制还是在submitDrawCommands和drawFrame里面，涉及到绘制信号同步，已经绘制命令的发送方式！！
         vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        // 如果运行时启用了validation layers并监视应用程序的内存使用情况，你会发现它在慢慢增加。原因是validation layers的实现期望与GPU同步。
+        // 虽然在技术上是不需要的，但是一旦这样做，每一针帧不会出现明显的性能影响。
+        // 我们可以在开始绘制下一帧之前明确的等待presentation完成:
+        vkQueueWaitIdle(presentQueue);
     }
 
     void mainLoop() {
@@ -366,7 +371,24 @@ private:
             // 为了最终呈现，将图像返还到交换链
             // 每个事件派发都有一个函数调用来对应，但它们的执行是异步的。函数调用将在操作实际完成之前返回，并且执行顺序也是未定义的。这是不理想的，因为每一个操作都取决于前一个操作
             drawFrame();
+
+            // 在很多应用程序的的状态也会在每一帧更新。为此更高效的绘制一阵的方式如下：
+            //void drawFrame() {
+            //    updateAppState();
+
+            //    vkQueueWaitIdle(presentQueue);    vkAcquireNextImageKHR(...)
+
+            //        submitDrawCommands();
+
+            //    vkQueuePresentKHR(presentQueue, &presentInfo);
+            //}
+            // 该方法允许我们更新应用程序的状态，比如运行游戏的AI协同程序，而前一帧被渲染。这样，始终保持CPU和GPU处于工作状态。
         }
+
+        // 需要了解的是drawFrame函数中所有的操作都是异步的。意味着当程序退出mainLoop，绘制和呈现操作可能仍然在执行。所以清理该部分的资源是不友好的。
+        // 为了解决这个问题，我们应该在退出mainLoop销毁窗体前等待逻辑设备的操作完成
+        vkDeviceWaitIdle(device);
+        // 也可以使用vkQueueWaitIdle等待特定命令队列中的操作完成。这些功能可以作为一个非常基本的方式来执行同步。这个时候窗体关闭后该问题不会出现
     }
 
     void cleanup() {
