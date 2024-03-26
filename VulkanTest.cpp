@@ -6,10 +6,12 @@
 // 这里没有显示的包含vk的头文件，因为我们使用了glfw的框架，但是要让vk生效的话，必须在包含glfw的头文件前，声明GLFW_INCLUDE_VULKAN的宏定义，这样才能正常使用
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
 
 #include <iostream>
 #include <stdexcept>
 #include <vector>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <optional>
@@ -29,13 +31,59 @@ const std::vector<const char*> validationLayers = {
     "VK_LAYER_KHRONOS_validation"
 };
 
-#define NDEBUG
+//#define NDEBUG
 
 #ifdef NDEBUG
 const bool enableValidationLayers = false;
 #else
 const bool enableValidationLayers = true;
 #endif
+
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        // VK_VERTEX_INPUT_RATE_VERTEX: Move to the next data entry after each vertex
+        // VK_VERTEX_INPUT_RATE_INSTANCE : Move to the next data entry after each instance
+        // We're not going to use instanced rendering, so we'll stick to per - vertex data.
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+        // vertex attributes
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        // The format parameter describes the type of data for the attribute.A bit confusingly, the formats are specified using the same enumeration as color formats.
+        // The following shader typesand formats are commonly used together :
+        // float : VK_FORMAT_R32_SFLOAT
+        // vec2 : VK_FORMAT_R32G32_SFLOAT
+        // vec3 : VK_FORMAT_R32G32B32_SFLOAT
+        // vec4 : VK_FORMAT_R32G32B32A32_SFLOAT
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        // color attributes
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+
+const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}},
+};
 
 static std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
@@ -174,6 +222,12 @@ private:
     // 在我们的例子中只会使用一个帧缓冲区:color attachment。然而我们作为附件的图像依赖交换链用于呈现时返回的图像。这意味着我们必须为交换链中的所有图像创建一个帧缓冲区，并在绘制的时候使用对应的图像
     std::vector<VkFramebuffer> swapChainFramebuffers;
 
+    // 顶点缓冲（但是这里只是demo里一个shader用的）
+    VkBuffer vertexBuffer;
+    // 具体给顶点缓冲绑定的内存
+    VkDeviceMemory vertexBufferMemory;
+
+
     VkPipeline graphicsPipeline;
     // Vulkan 渲染通道，在我们完成管线的创建工作之前，我们需要告诉Vulkan渲染时候使用的framebuffer帧缓冲区附件相关信息。
     // 我们需要指定多少个颜色和深度缓冲区将会被使用，指定多少个采样器被用到及在整个渲染操作中相关的内容如何处理。
@@ -222,6 +276,8 @@ private:
         createGraphicsPipeline();
         // 创建帧缓冲
         createFramebuffers();
+        // 创建顶点缓冲（之前shader硬编码画三角形不是常规方式）
+        createVertexBuffer();
         // 创建命令缓冲
         createCommandPool();
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
@@ -230,6 +286,64 @@ private:
         createSemaphores();
 
         submitDrawCommands();
+    }
+
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+        
+        throw std::runtime_error("failed to find suitable memory type!");
+    }
+    
+    void createVertexBuffer() {
+
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = sizeof(vertices[0]) * vertices.size();
+        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        // Just like the images in the swap chain, buffers can also be owned by a specific queue family or be shared between multiple at the same time. 
+        // The buffer will only be used from the graphics queue, so we can stick to exclusive access
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create vertex buffer!");
+        }
+
+        // 查询内存需求
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        // 查找具体我们需要的内存类型，host_visible就是后面可以在cpu这边map的类型
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        }
+
+        // 如果通过了上面的实际内存分配，我们就可以把分配的内存绑定到顶点缓冲上了
+        // the fourth parameter is the offset within the region of memory. Since this memory is allocated specifically for this the vertex buffer, 
+        // the offset is simply 0. If the offset is non-zero, then it is required to be divisible by memRequirements.alignment
+        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+
+        // 最终实际的映射内存
+        // You can now simply memcpy the vertex data to the mapped memory and unmap it again using vkUnmapMemory. 
+        // Unfortunately the driver may not immediately copy the data into the buffer memory, for example because of caching. 
+        // It is also possible that writes to the buffer are not visible in the mapped memory yet. There are two ways to deal with that problem:
+        // Use a memory heap that is host coherent, indicated with VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+        // Call vkFlushMappedMemoryRanges after writing to the mapped memory, and call vkInvalidateMappedMemoryRanges before reading from the mapped memory
+        void* data = nullptr;
+        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+        memcpy(data, vertices.data(), (size_t)bufferInfo.size);
+        vkUnmapMemory(device, vertexBufferMemory);
     }
 
     void submitDrawCommands() {
@@ -275,12 +389,18 @@ private:
             // 第二个参数指定具体管线类型，graphics or compute pipeline。
             // 我们告诉Vulkan在图形管线中每一个操作如何执行及哪个附件将会在片段着色器中使用，所以剩下的就是告诉它绘制三角形
             vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+            // 绑定顶点缓冲
+            VkBuffer vertexBuffers[] = { vertexBuffer };
+            VkDeviceSize offsets[] = { 0 };
+            vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
+
             // 实际的vkCmdDraw函数有点与字面意思不一致，它是如此简单，仅因为我们提前指定所有渲染相关的信息。它有如下的参数需要指定，除了命令缓冲区:
             // vertexCount: 即使我们没有顶点缓冲区，但是我们仍然有3个定点需要绘制。
             // instanceCount: 用于instanced 渲染，如果没有使用请填1。
             // firstVertex : 作为顶点缓冲区的偏移量，定义gl_VertexIndex的最小值。
             // firstInstance : 作为instanced 渲染的偏移量，定义了gl_InstanceIndex的最小值。
-            vkCmdDraw(commandBuffers[i], 3, 1, 0, 0);
+            vkCmdDraw(commandBuffers[i], vertices.size(), 1, 0, 0);
             // render pass执行完绘制，可以结束渲染作业
             vkCmdEndRenderPass(commandBuffers[i]);
             // 并停止记录命令缓冲区的工作:
@@ -408,6 +528,11 @@ private:
 
         vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroySwapchainKHR(device, swapChain, nullptr);
+
+        // 删除顶点缓冲
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        // 释放配套内存
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
 
         // 删除命令池
         vkDestroyCommandPool(device, commandPool, nullptr);
@@ -871,10 +996,14 @@ private:
         // 因为我们将顶点数据硬编码到vertex shader中，所以我们将要填充的结构体没有顶点数据去加载。我们将会在vertex buffer章节中回来操作
         VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInputInfo.vertexBindingDescriptionCount = 0;
-        vertexInputInfo.pVertexBindingDescriptions = nullptr; // Optional
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
-        vertexInputInfo.pVertexAttributeDescriptions = nullptr; // Optional
+
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+        vertexInputInfo.vertexBindingDescriptionCount = 1;
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
+        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
         // pVertexBindingDescriptions和pVertexAttributeDescriptions成员指向结构体数组，用于进一步描述加载的顶点数据信息。在createGraphicsPipeline函数中的shaderStages数组后添加该结构体????
 
         // 输入组件------
