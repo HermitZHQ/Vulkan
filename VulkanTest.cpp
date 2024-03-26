@@ -276,10 +276,10 @@ private:
         createGraphicsPipeline();
         // 创建帧缓冲
         createFramebuffers();
-        // 创建顶点缓冲（之前shader硬编码画三角形不是常规方式）
-        createVertexBuffer();
         // 创建命令缓冲
         createCommandPool();
+        // 创建顶点缓冲（之前shader硬编码画三角形不是常规方式），因为内部会用到命令缓冲，所以必须放在命令池的创建之后！
+        createVertexBuffer();
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
         createCommandBuffers();
         // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
@@ -297,42 +297,53 @@ private:
                 return i;
             }
         }
-        
+
         throw std::runtime_error("failed to find suitable memory type!");
     }
-    
-    void createVertexBuffer() {
 
+    // 封装后的帮助函数，专门创建buffer用，方便创建多个不同类型的buffer
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = sizeof(vertices[0]) * vertices.size();
-        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-        // Just like the images in the swap chain, buffers can also be owned by a specific queue family or be shared between multiple at the same time. 
-        // The buffer will only be used from the graphics queue, so we can stick to exclusive access
+        bufferInfo.size = size;
+        bufferInfo.usage = usage;
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create vertex buffer!");
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create buffer!");
         }
 
-        // 查询内存需求
         VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+        vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = memRequirements.size;
-        // 查找具体我们需要的内存类型，host_visible就是后面可以在cpu这边map的类型
-        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
 
-        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
-            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate buffer memory!");
         }
 
-        // 如果通过了上面的实际内存分配，我们就可以把分配的内存绑定到顶点缓冲上了
-        // the fourth parameter is the offset within the region of memory. Since this memory is allocated specifically for this the vertex buffer, 
-        // the offset is simply 0. If the offset is non-zero, then it is required to be divisible by memRequirements.alignment
-        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);
+    }
+    
+    void createVertexBuffer() {
+
+        // 此阶段（针对git提交）主要讲解的是如何使用分段缓存，而不是直接使用CPU这边的内存来让GPU去读取（上一个git提交就演示了如何使用cpu这边的）
+        // 针对目前的简单绘制，我们提交到GPU内存可能看不出优化性能，但是如果后期绘制量上去以后，性能的差异就会体现出来了（所以最好直接采用分段缓存staging buffer）
+        // 当然了，这种情况不适用于我们需要动态修改顶点的情况，但是大部分静态模型应该都是适合的，骨骼动画也是通过shader传递的变换，也不需要
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        // We're now using a new stagingBuffer with stagingBufferMemory for mapping and copying the vertex data. 
+        // In this chapter we're going to use two new buffer usage flags:
+        // VK_BUFFER_USAGE_TRANSFER_SRC_BIT: Buffer can be used as source in a memory transfer operation.
+        // VK_BUFFER_USAGE_TRANSFER_DST_BIT : Buffer can be used as destination in a memory transfer operation.
+        // 使用这种阶段性的缓冲后，我们可以看到两次创建的buffer的不同，并不在第一次就创建vertex buffer了，而且创建的一个src的host buffer，第二次才创建dest的local device(gpu)的buffer
+        // 使用了local device标记的内存，一般来说我们都无法再次去使用vkMapMemory了，这里要注意一下
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
 
         // 最终实际的映射内存
         // You can now simply memcpy the vertex data to the mapped memory and unmap it again using vkUnmapMemory. 
@@ -340,10 +351,58 @@ private:
         // It is also possible that writes to the buffer are not visible in the mapped memory yet. There are two ways to deal with that problem:
         // Use a memory heap that is host coherent, indicated with VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
         // Call vkFlushMappedMemoryRanges after writing to the mapped memory, and call vkInvalidateMappedMemoryRanges before reading from the mapped memory
-        void* data = nullptr;
-        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
-        memcpy(data, vertices.data(), (size_t)bufferInfo.size);
-        vkUnmapMemory(device, vertexBufferMemory);
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, vertices.data(), (size_t)bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+        // 使用分段缓存进行copy，最终会使用cmd queue将buffer拷贝到local device中
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        // 最后别忘了释放相关资源。。。。（真是很麻烦啊，什么都要自己控制）
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        // 拷贝缓冲前，我们需要做好提交命令的准备（usage可以使用一次性提交）
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        VkBufferCopy copyRegion{};
+        copyRegion.srcOffset = 0; // Optional
+        copyRegion.dstOffset = 0; // Optional
+        copyRegion.size = size;
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        // 装载完cmd后，并不会马上触发，还需要我们手动去触发这个命令
+        vkEndCommandBuffer(commandBuffer);
+
+        // 手动提交此次命令，进行执行
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);
+
+        // 释放此次单独生成的cmd
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
     void submitDrawCommands() {
