@@ -97,10 +97,12 @@ const std::vector<uint16_t> indices = {
     0, 1, 2, 2, 3, 0
 };
 
+// 关于vk的shader字节对齐，一般是以4字节对齐，但是像mat4这种结构体，就会以16字节对齐，如果你在前面加上一个glm::vec2的变量，就会导致绑定shader ubo失效
+// 因为在c++中，如果你第一个变量是vec2，就会变成8字节对齐，这里就不做赘述了，总之为了防止奇怪的问题出现，我们最好都显示加上这种对齐处理
 struct UniformBufferObject {
-    glm::mat4 model;
-    glm::mat4 view;
-    glm::mat4 proj;
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
 };
 
 static std::vector<char> readFile(const std::string& filename) {
