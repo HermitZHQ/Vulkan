@@ -23,6 +23,10 @@
 #include <string>
 #include <fstream>
 
+// for texture load
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 const int WIDTH = 800;
 const int HEIGHT = 600;
 
@@ -48,6 +52,7 @@ const bool enableValidationLayers = true;
 struct Vertex {
     glm::vec2 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -61,8 +66,8 @@ struct Vertex {
         return bindingDescription;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
         // vertex attributes
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
@@ -81,16 +86,22 @@ struct Vertex {
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
 
+        // tex coord
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
         return attributeDescriptions;
     }
 };
 
 // 之前尝试了非index的draw，我们添加的3个点没有画出来，是因为旋转的顺序不对，如果不采用index的情况（一般不可能，都是会用index，我这里只是记录我当时没画出来的问题），要注意新加3个点的旋转（需要顺时针）
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
@@ -216,7 +227,7 @@ private:
     // 这些uniform数值需要在管线创建过程中，通过VkPipelineLayout对象指定。即使在后续内容中用到，我们也仍然需要创建一个空的pipeline layout
     VkPipelineLayout pipelineLayout;
 
-    // uniform buffer object相关变量
+    // uniform buffer object相关变量--------
     VkDescriptorSetLayout descriptorSetLayout;
     // 描述符池 + 描述符集
     VkDescriptorPool descriptorPool;
@@ -248,18 +259,26 @@ private:
     // 在我们的例子中只会使用一个帧缓冲区:color attachment。然而我们作为附件的图像依赖交换链用于呈现时返回的图像。这意味着我们必须为交换链中的所有图像创建一个帧缓冲区，并在绘制的时候使用对应的图像
     std::vector<VkFramebuffer> swapChainFramebuffers;
 
-    // 顶点缓冲（但是这里只是demo里一个shader用的）
+    // 顶点缓冲（但是这里只是demo里一个shader用的）--------
     VkBuffer vertexBuffer;
     // 具体给顶点缓冲绑定的内存
     VkDeviceMemory vertexBufferMemory;
     // 索引缓冲和上面类似
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
-    // uniform buffer object相关
+    // uniform buffer object相关--------
     std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
     std::vector<void*> uniformBuffersMapped;
 
+
+    // texture相关--------
+    VkImage textureImage;
+    VkDeviceMemory textureImageMemory;
+    VkImageView textureImageView;
+    // Note the sampler does not reference a VkImage anywhere. The sampler is a distinct object that provides an interface to extract colors from a texture. 
+    // It can be applied to any image you want, whether it is 1D, 2D or 3D. This is different from many older APIs, which combined texture images and filtering into a single state.
+    VkSampler textureSampler;
 
     VkPipeline graphicsPipeline;
     // Vulkan 渲染通道，在我们完成管线的创建工作之前，我们需要告诉Vulkan渲染时候使用的framebuffer帧缓冲区附件相关信息。
@@ -305,6 +324,7 @@ private:
         createImageViews();
         // 创建渲染通道
         createRenderPass();
+
         // 创建ubo（uniform buffer object），需要在创建管线前完成（因为我们将要在创建管线中用到它）
         createDescriptorSetLayout();
         // 创建图形管线
@@ -313,6 +333,14 @@ private:
         createFramebuffers();
         // 创建命令缓冲
         createCommandPool();
+
+        // 创建纹理图片
+        createTextureImage();
+        // 创建图片浏览器
+        createTextureImageView();
+        // 创建纹理采样器
+        createTextureSampler();
+
         // 创建顶点缓冲（之前shader硬编码画三角形不是常规方式），因为内部会用到命令缓冲，所以必须放在命令池的创建之后！
         createVertexBuffer();
         // 创建索引缓冲
@@ -323,12 +351,338 @@ private:
         createDescriptorPool();
         // 创建描述符集
         createDescriptorSets();
+
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
         createCommandBuffers();
         // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
         createSemaphores();
 
         submitDrawCommands(0);
+    }
+
+    void createTextureSampler() {
+
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+        // 各项异性采样
+        samplerInfo.anisotropyEnable = VK_TRUE;
+
+        // 为了得到可用的各向异性采样值，我们需要从设备属性中查找一下
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        samplerInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;
+
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        // he unnormalizedCoordinates field specifies which coordinate system you want to use to address texels in an image. 
+        // If this field is VK_TRUE, then you can simply use coordinates within the [0, texWidth) and [0, texHeight) range. 
+        // If it is VK_FALSE, then the texels are addressed using the [0, 1) range on all axes. 
+        // Real-world applications almost always use normalized coordinates, because then it's possible to use textures of varying resolutions with the exact same coordinates.
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+
+        // If a comparison function is enabled, then texels will first be compared to a value, and the result of that comparison is used in filtering operations. 
+        // This is mainly used for percentage-closer filtering on shadow maps. We'll look at this in a future chapter.
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 0.0f;
+
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create texture sampler!");
+        }
+    }
+
+    VkImageView createImageView(VkImage image, VkFormat format) {
+
+        // 创建图像视图的参数被定义在VkImageViewCreateInfo结构体中。前几个参数的填充非常简单、直接
+        VkImageViewCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        createInfo.image = image;
+        // 其中viewType和format字段用于描述图像数据该被如何解释。viewType参数允许将图像定义为1D textures, 2D textures,3D textures 和cube maps
+        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        createInfo.format = format;
+        // components字段允许调整颜色通道的最终的映射逻辑。比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理。我们也可以将通道映射具体的常量数值0和1。在章节中我们使用默认的映射策略
+        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域。我们的图像将会作为color targets，没有任何mipmapping levels 或是多层 multiple layers
+        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        createInfo.subresourceRange.baseMipLevel = 0;
+        createInfo.subresourceRange.levelCount = 1;
+        createInfo.subresourceRange.baseArrayLayer = 0;
+        createInfo.subresourceRange.layerCount = 1;
+        // 如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要
+
+        // 创建图像视图调用vkCreateImageView函数
+        VkImageView imageView;
+        if (vkCreateImageView(device, &createInfo, nullptr, &imageView) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image views!");
+        }
+
+        // 拥有了图像视图后，使用图像作为贴图已经足够了，但是它还没有准备好作为渲染的 target
+        // 它需要更多的间接步骤去准备，其中一个就是 framebuffer，被称作帧缓冲区。但首先我们要设置图形管线
+
+        return imageView;
+    }
+
+    void createTextureImageView() {
+
+        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB);
+    }
+
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = {
+            width,
+            height,
+            1
+        };
+
+        vkCmdCopyBufferToImage(
+            commandBuffer,
+            buffer,
+            image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &region
+        );
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // One of the most common ways to perform layout transitions is using an image 'MEMORY BARRIER'
+        // A 'PIPELINE BARRIER' like that is generally used to synchronize access to resources
+        // like ensuring that a write to a buffer completes before reading from it, 
+        // but it can also be used to transition image layouts and transfer queue family ownership when VK_SHARING_MODE_EXCLUSIVE is used
+        // 之前bs5上的cod图形问题，就出在了pipeline barrier的命令解析里（当时好像和astc的解码有关系，有没有处理的layout？），这段pipeline barrier的处理要特别注意一下
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        // VK_IMAGE_LAYOUT_UNDEFINED as oldLayout if you don't care about the existing contents of the image.
+        barrier.oldLayout = oldLayout;
+        barrier.newLayout = newLayout;
+
+        // If you are using the barrier to transfer queue family ownership, then these two fields should be the indices of the queue families. 
+        // They must be set to VK_QUEUE_FAMILY_IGNORED if you don't want to do this (NOT THE DEFAULT VALUE!).
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+
+        // The image and subresourceRange specify the image that is affected and the specific part of the image. 
+        // Our image is not an array and does not have mipmapping levels, so only one level and layer are specified.
+        barrier.image = image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        // Barriers are primarily used for synchronization purposes, 
+        // so you must specify which types of operations that involve the resource must happen before the barrier, 
+        // and which operations that involve the resource must wait on the barrier
+
+        // There are two transitions we need to handle:
+        // Undefined → transfer destination : transfer writes that don't need to wait on anything
+        // Transfer destination → shader reading : shader reads should wait on transfer writes, specifically the shader reads in the fragment shader, because that's where we're going to use the texture
+        VkPipelineStageFlags sourceStage;
+        VkPipelineStageFlags destinationStage;
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+        else {
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+
+        //barrier.srcAccessMask = 0; // TODO
+        //barrier.dstAccessMask = 0; // TODO
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            sourceStage, destinationStage,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrier
+        );
+
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    // 将单次发送的cmd buffer重新封装成begin single和end single两个函数，方便后续的重复使用
+    VkCommandBuffer beginSingleTimeCommands() {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        // 准备开始装载cmd buffer
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        return commandBuffer;
+    }
+
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
+
+        // 装载完cmd后，并不会马上触发，还需要我们手动去触发这个命令
+        vkEndCommandBuffer(commandBuffer);
+
+        // 手动提交此次命令，进行执行
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(graphicsQueue);
+
+        // 释放此次单独生成的cmd
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+
+        // 虽然在shader中我们可以直接读取像素的buffer，但是在vk中我们最好还是使用Image的对象来进行操作（更快，更便捷）
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.extent.width = static_cast<uint32_t>(width);
+        imageInfo.extent.height = static_cast<uint32_t>(height);
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        // 这里的fmt必须和我们读取的一致（因为我们强制读取的rgba，这里也需要对应），否则后续的copy操作就会失败
+        imageInfo.format = format;
+        // VK_IMAGE_TILING_LINEAR: Texels are laid out in row - major order like our pixels array
+        // VK_IMAGE_TILING_OPTIMAL : Texels are laid out in an implementation defined order for optimal access
+        // Unlike the layout of an image, the tiling mode cannot be changed at a later time. 
+        // If you want to be able to directly access texels in the memory of the image, then you must use VK_IMAGE_TILING_LINEAR. 
+        // We will be using a staging buffer instead of a staging image, so this won't be necessary. We will be using VK_IMAGE_TILING_OPTIMAL for efficient access from the shader.
+        imageInfo.tiling = tiling;
+        // There are only two possible values for the initialLayout of an image :
+        // VK_IMAGE_LAYOUT_UNDEFINED: Not usable by the GPUand the very first transition will discard the texels.
+        // VK_IMAGE_LAYOUT_PREINITIALIZED : Not usable by the GPU, but the first transition will preserve the texels.
+        // There are few situations where it is necessary for the texels to be preserved during the first transition.
+        // One example, however, would be if you wanted to use an image as a staging image in combination with the VK_IMAGE_TILING_LINEAR layout.
+        // In that case, you'd want to upload the texel data to it and then transition the image to be a transfer source without losing the data. 
+        // In our case, however, we're first going to transition the image to be a transfer destination and then copy texel data to it from a buffer object, 
+        // so we don't need this property and can safely use VK_IMAGE_LAYOUT_UNDEFINED.
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // The usage field has the same semantics as the one during buffer creation. The image is going to be used as destination for the buffer copy, 
+        // so it should be set up as a transfer destination. We also want to be able to access the image from the shader to color our mesh, so the usage should include VK_IMAGE_USAGE_SAMPLED_BIT.
+        imageInfo.usage = usage;
+        // The image will only be used by one queue family: the one that supports graphics (and therefore also) transfer operations.
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // The samples flag is related to multisampling. This is only relevant for images that will be used as attachments, so stick to one sample. 
+        // There are some optional flags for images that are related to sparse images. Sparse images are images where only certain regions are actually backed by memory. 
+        // If you were using a 3D texture for a voxel terrain, for example, then you could use this to avoid allocating memory to store large volumes of "air" values. 
+        // We won't be using it in this tutorial, so leave it to its default value of 0.
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.flags = 0; // Optional
+
+        if (vkCreateImage(device, &imageInfo, nullptr, &textureImage) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image!");
+        }
+
+        VkMemoryRequirements memRequirements;
+        // 这里和之前的vbo和ibo稍微有点区别（vkGetBufferMemoryRequirements），Image有它专属的内存检测接口
+        vkGetImageMemoryRequirements(device, textureImage, &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &textureImageMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate image memory!");
+        }
+
+        // 这里和vbo和ibo也有image的区别（vkBindBufferMemory）
+        vkBindImageMemory(device, textureImage, textureImageMemory, 0);
+    }
+
+    void createTextureImage() {
+        // 由于创建时要用到commandPool，所以调用也必须再createCommandPool之后
+
+        int texWidth, texHeight, texChannels;
+        // 这个读取接口有一个好处，就是一旦指定了最后的参数STBI_rgb_alpha，那么就会按照这个格式强制读取，比如我们实际的channels是3，比如rgb
+        // 但是最终读取出来的像素，会自动为我们加上一个空的a通道，这样就省去了我们各种判断的麻烦（这个库确实这方面还可以）
+        stbi_uc* pixels = stbi_load("textures/texture01.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        VkDeviceSize imageSize = texWidth * texHeight * 4;
+
+        if (!pixels) {
+            throw std::runtime_error("failed to load texture image!");
+        }
+
+        // 为staging buffer做准备，大致上和vbo和ibo是一样的
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        // 直接将图片的pixels拷贝到staging buffer里
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+        memcpy(data, pixels, static_cast<size_t>(imageSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // 记得释放pixels
+        stbi_image_free(pixels);
+
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+
+        // 装换image的layout到dst
+        // Remember that we can do this because we don't care about its contents before performing the copy operation.
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // 把staging buffer copy到textureImage中
+        copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+
+        // To be able to start sampling from the texture image in the shader, we need one last transition to prepare it for shader access:
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
     void createDescriptorSets() {
@@ -353,18 +707,30 @@ private:
             bufferInfo.offset = 0;
             bufferInfo.range = sizeof(UniformBufferObject);
 
-            VkWriteDescriptorSet descriptorWrite{};
-            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            descriptorWrite.dstSet = descriptorSets[i];
-            descriptorWrite.dstBinding = 0;
-            descriptorWrite.dstArrayElement = 0;
-            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            descriptorWrite.descriptorCount = 1;
-            descriptorWrite.pBufferInfo = &bufferInfo;
-            descriptorWrite.pImageInfo = nullptr; // Optional
-            descriptorWrite.pTexelBufferView = nullptr; // Optional
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = textureImageView;
+            imageInfo.sampler = textureSampler;
 
-            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+            std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].dstSet = descriptorSets[i];
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrites[0].descriptorCount = 1;
+            descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = descriptorSets[i];
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pImageInfo = &imageInfo;
+
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
         }
     }
 
@@ -422,18 +788,43 @@ private:
 
     void createDescriptorSetLayout() {
 
+        // 创建普通uniform描述符-----------------------------------
         VkDescriptorSetLayoutBinding uboLayoutBinding{};
-        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.binding = 0;// 这里对应shader中的binding id，这里的id千万不能乱填，否则整个程序都会崩溃的
         uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         // 由于我们shader中没有使用数组，所以这里是1，比如骨骼动画的话，就可以在shader中使用数组，然后这里对应数量
         uboLayoutBinding.descriptorCount = 1;
         uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
         uboLayoutBinding.pImmutableSamplers = nullptr; // Optional
 
+        // 创建combined image sampler-----------------------------------
+        VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+        samplerLayoutBinding.binding = 1;// 这里对应shader中的binding id，这里的id千万不能乱填，否则整个程序都会崩溃的
+        samplerLayoutBinding.descriptorCount = 1;
+        samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        samplerLayoutBinding.pImmutableSamplers = nullptr;
+        // Make sure to set the stageFlags to indicate that we intend to use the combined image sampler descriptor in the fragment shader. 
+        // That's where the color of the fragment is going to be determined. 
+        // It is possible to use texture sampling in the vertex shader, for example to dynamically deform a grid of vertices by a heightmap.
+        samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboLayoutBinding, samplerLayoutBinding };
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &uboLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
@@ -543,21 +934,8 @@ private:
     }
 
     void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
-        // 拷贝缓冲前，我们需要做好提交命令的准备（usage可以使用一次性提交）
-        VkCommandBufferAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool = commandPool;
-        allocInfo.commandBufferCount = 1;
 
-        VkCommandBuffer commandBuffer;
-        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
         VkBufferCopy copyRegion{};
         copyRegion.srcOffset = 0; // Optional
@@ -565,20 +943,7 @@ private:
         copyRegion.size = size;
         vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
 
-        // 装载完cmd后，并不会马上触发，还需要我们手动去触发这个命令
-        vkEndCommandBuffer(commandBuffer);
-
-        // 手动提交此次命令，进行执行
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
-
-        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(graphicsQueue);
-
-        // 释放此次单独生成的cmd
-        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+        endSingleTimeCommands(commandBuffer);
     }
 
     void submitDrawCommands(uint32_t currentFrame) {
@@ -771,6 +1136,14 @@ private:
         // 删除渲染通道
         vkDestroyRenderPass(device, renderPass, nullptr);
 
+        // 删除采样器
+        vkDestroySampler(device, textureSampler, nullptr);
+        // 删除图像浏览（注意顺序，这里好像和创建是反的？）
+        vkDestroyImageView(device, textureImageView, nullptr);
+        // 删除纹理和纹理内存
+        vkDestroyImage(device, textureImage, nullptr);
+        vkFreeMemory(device, textureImageMemory, nullptr);
+
         vkDestroySurfaceKHR(instance, surface, nullptr);
         vkDestroySwapchainKHR(device, swapChain, nullptr);
 
@@ -929,6 +1302,8 @@ private:
         queueCreateInfo.pQueuePriorities = &queuePriority;
 
         VkPhysicalDeviceFeatures deviceFeatures = {};
+        // 有些采样器的功能，需要我们在创建device的时候开启才能用
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
 
         VkDeviceCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1044,33 +1419,7 @@ private:
         swapChainImageViews.resize(swapChainImages.size());
         // 下一步，循环迭代所有的交换链图像
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            // 创建图像视图的参数被定义在VkImageViewCreateInfo结构体中。前几个参数的填充非常简单、直接
-            VkImageViewCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImages[i];
-            // 其中viewType和format字段用于描述图像数据该被如何解释。viewType参数允许将图像定义为1D textures, 2D textures,3D textures 和cube maps
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = swapChainImageFormat;
-            // components字段允许调整颜色通道的最终的映射逻辑。比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理。我们也可以将通道映射具体的常量数值0和1。在章节中我们使用默认的映射策略
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-            // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域。我们的图像将会作为color targets，没有任何mipmapping levels 或是多层 multiple layers
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-            // 如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要
-            
-            // 创建图像视图调用vkCreateImageView函数
-            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
-                throw std::runtime_error("failed to create image views!");
-            }
-
-            // 拥有了图像视图后，使用图像作为贴图已经足够了，但是它还没有准备好作为渲染的 target
-            // 它需要更多的间接步骤去准备，其中一个就是 framebuffer，被称作帧缓冲区。但首先我们要设置图形管线
+            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat);
         }
 
     }
@@ -1594,9 +1943,11 @@ private:
         //        Swap extent(resolution of images in swap chain)
         //        首先在脑海中对每一个设置都有一个理想的数值，如果达成一致我们就使用，否则我们一起创建一些逻辑去找到更好的规则、数值。
 
+        VkPhysicalDeviceFeatures supportedFeatures;
+        vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
 
         // 满足多方面的设备要求后，才能算最终的通过检测（队列簇，扩展支持，交换链支持）
-        return indices.isComplete() && extensionsSupported && swapChainAdequate;
+        return indices.isComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.samplerAnisotropy;
     }
 
     bool checkDeviceExtensionSupport(VkPhysicalDevice device) {
