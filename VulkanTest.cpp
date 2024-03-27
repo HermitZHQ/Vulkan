@@ -6,7 +6,11 @@
 // 这里没有显示的包含vk的头文件，因为我们使用了glfw的框架，但是要让vk生效的话，必须在包含glfw的头文件前，声明GLFW_INCLUDE_VULKAN的宏定义，这样才能正常使用
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <chrono>
 
 #include <iostream>
 #include <stdexcept>
@@ -21,6 +25,8 @@
 
 const int WIDTH = 800;
 const int HEIGHT = 600;
+
+#define MAX_FRAMES_IN_FLIGHT 3
 
 // 关于vk pipeline的一些重点知识：
 // 如果之前使用过旧的API(OpenGL和Direct3D),那么将可以随意通过glBlendFunc和OMSetBlendState调用更改管线设置。Vulkan中的图形管线几乎不可改变，因此如果需要更改着色器，绑定到不同的帧缓冲区或者更改混合函数，则必须从头创建管线。
@@ -89,6 +95,12 @@ const std::vector<Vertex> vertices = {
 
 const std::vector<uint16_t> indices = {
     0, 1, 2, 2, 3, 0
+};
+
+struct UniformBufferObject {
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
 };
 
 static std::vector<char> readFile(const std::string& filename) {
@@ -202,6 +214,12 @@ private:
     // 这些uniform数值需要在管线创建过程中，通过VkPipelineLayout对象指定。即使在后续内容中用到，我们也仍然需要创建一个空的pipeline layout
     VkPipelineLayout pipelineLayout;
 
+    // uniform buffer object相关变量
+    VkDescriptorSetLayout descriptorSetLayout;
+    // 描述符池 + 描述符集
+    VkDescriptorPool descriptorPool;
+    std::vector<VkDescriptorSet> descriptorSets;
+
     VkSwapchainKHR swapChain;// 现在添加一个类成员变量存储VkSwapchainKHR对象:
     // 交换链创建后，需要获取VkImage相关的句柄。它会在后续渲染的章节中引用。添加类成员变量存储该句柄:
     std::vector<VkImage> swapChainImages;// 图像被交换链创建，也会在交换链销毁的同时自动清理，所以我们不需要添加任何清理代码。
@@ -235,6 +253,10 @@ private:
     // 索引缓冲和上面类似
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
+    // uniform buffer object相关
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped;
 
 
     VkPipeline graphicsPipeline;
@@ -281,6 +303,8 @@ private:
         createImageViews();
         // 创建渲染通道
         createRenderPass();
+        // 创建ubo（uniform buffer object），需要在创建管线前完成（因为我们将要在创建管线中用到它）
+        createDescriptorSetLayout();
         // 创建图形管线
         createGraphicsPipeline();
         // 创建帧缓冲
@@ -291,12 +315,127 @@ private:
         createVertexBuffer();
         // 创建索引缓冲
         createIndexBuffer();
+        // 创建ubo相关资源
+        createUniformBuffers();
+        // 创建描述符池（ubo等buffer使用）
+        createDescriptorPool();
+        // 创建描述符集
+        createDescriptorSets();
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
         createCommandBuffers();
         // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
         createSemaphores();
 
-        submitDrawCommands();
+        submitDrawCommands(0);
+    }
+
+    void createDescriptorSets() {
+        // 描述符集的分配需要使用到描述符池，所以我们这个函数调用应该在Descriptor pool创建之后
+        // 综合目前看的情况来说，一般你想创建一个对象，比如descriptorPool，你即便没有创建描述符池，但是根据它结构体的填充，你也必须要回溯到之前的步骤（才能填充描述符池这种成员变量）
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool;
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        allocInfo.pSetLayouts = layouts.data();
+
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+        // 描述符集是目前唯一说明不用显示释放的，它会在释放描述符池的时候一起释放（也就是说我们还是需要释放描述符池）
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            bufferInfo.range = sizeof(UniformBufferObject);
+
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrite.dstBinding = 0;
+            descriptorWrite.dstArrayElement = 0;
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrite.descriptorCount = 1;
+            descriptorWrite.pBufferInfo = &bufferInfo;
+            descriptorWrite.pImageInfo = nullptr; // Optional
+            descriptorWrite.pTexelBufferView = nullptr; // Optional
+
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        }
+    }
+
+    void createDescriptorPool() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolInfo.flags = 0;// default vaule
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    void updateUniformBuffer(uint32_t currentImage) {
+        // 这里有个很神奇的点，我之前以为要做成旋转的效果，应该每一帧都需要更新调用submitDrawCommand
+        // 也就是要绑定vbo，ibo，ubo，然后重画，但是我发现，那些绑定居然只需要一次。。。。
+        // 连vkCmdDrawIndexed这种绘制命令都不需要反复调用？？我们只要更新了关联的ubo数据，vk就会默认我们需要更新图像（且那些设置都使用第一次保存下来的）
+        // 而且我尝试了下，每帧去更新submitDrawCommand，反而会报错。。。
+        // 这个地方需要记忆一下，暂时感觉理解不了
+
+        static auto startTime = std::chrono::high_resolution_clock::now();
+
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
+        ubo.proj[1][1] *= -1;
+
+        memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+    }
+
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
+    void createDescriptorSetLayout() {
+
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        uboLayoutBinding.binding = 0;
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        // 由于我们shader中没有使用数组，所以这里是1，比如骨骼动画的话，就可以在shader中使用数组，然后这里对应数量
+        uboLayoutBinding.descriptorCount = 1;
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        uboLayoutBinding.pImmutableSamplers = nullptr; // Optional
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
     }
 
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -440,7 +579,7 @@ private:
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
-    void submitDrawCommands() {
+    void submitDrawCommands(uint32_t currentFrame) {
 
         // flags标志位参数用于指定如何使用命令缓冲区。可选的参数类型如下:
         // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: 命令缓冲区将在执行一次后立即重新记录。
@@ -492,6 +631,9 @@ private:
             // 绑定索引缓冲
             vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT16);
 
+            // 绑定描述符急，才能最终试ubo的系列设置生效？
+            vkCmdBindDescriptorSets(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
+
             // 实际的vkCmdDraw函数有点与字面意思不一致，它是如此简单，仅因为我们提前指定所有渲染相关的信息。它有如下的参数需要指定，除了命令缓冲区:
             // vertexCount: 即使我们没有顶点缓冲区，但是我们仍然有3个定点需要绘制。
             // instanceCount: 用于instanced 渲染，如果没有使用请填1。
@@ -520,6 +662,9 @@ private:
         // 最后的参数指定交换链中成为available状态的图像对应的索引。其中索引会引用交换链图像数组swapChainImages的图像VkImage。我们使用这个索引选择正确的命令缓冲区
         uint32_t imageIndex;
         vkAcquireNextImageKHR(device, swapChain, std::numeric_limits<uint64_t>::max(), imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        // 更新ubo
+        updateUniformBuffer(imageIndex);
 
         // 提交命令缓冲区
         // 队列提交和同步通过VkSubmitInfo结构体进行参数配置。
@@ -588,7 +733,7 @@ private:
             // 每个事件派发都有一个函数调用来对应，但它们的执行是异步的。函数调用将在操作实际完成之前返回，并且执行顺序也是未定义的。这是不理想的，因为每一个操作都取决于前一个操作
             drawFrame();
 
-            // 在很多应用程序的的状态也会在每一帧更新。为此更高效的绘制一阵的方式如下：
+            // 在很多应用程序的的状态也会在每一帧更新。为此更高效的绘制一帧的方式如下：
             //void drawFrame() {
             //    updateAppState();
 
@@ -633,6 +778,17 @@ private:
         vkFreeMemory(device, vertexBufferMemory, nullptr);
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
+
+        // 删除ubo相关
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
+        // 删除描述符池（描述符集将跟随被释放）
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        // 删除描述符布局（uniform buffer object）
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 
         // 删除命令池
         vkDestroyCommandPool(device, commandPool, nullptr);
@@ -1167,7 +1323,7 @@ private:
         rasterizer.lineWidth = 1.0f;
         // cullMode变量用于决定面裁剪的类型方式。可以禁止culling，裁剪front faces，cull back faces 或者全部。
         // frontFace用于描述作为front-facing面的顶点的顺序，可以是顺时针也可以是逆时针
-        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        rasterizer.cullMode = VK_CULL_MODE_NONE;// unifrom这个示例中，由于反向了Y坐标，导致三角形方向反向，顺时针是看不见的，所以我取消了cullMode，也可以改下面的参数改为逆时针（但是为了避免一些其他错误，先直接取消吧）
         rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
         // 光栅化可以通过添加常量或者基于片元的斜率来更改深度值。一些时候对于阴影贴图是有用的，但是我们不会在章节中使用，设置depthBiasEnable为VK_FALSE
         rasterizer.depthBiasEnable = VK_FALSE;
@@ -1284,8 +1440,8 @@ private:
         // 该结构体还指定了push常量，这是将动态值传递给着色器的另一个方式。pipeline layout可以在整个程序的生命周期内引用，所以它在程序退出的时候进行销毁
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0; // Optional
-        pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+        pipelineLayoutInfo.setLayoutCount = 1; // Optional
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout; // Optional
         pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
         pipelineLayoutInfo.pPushConstantRanges = 0; // Optional
 
