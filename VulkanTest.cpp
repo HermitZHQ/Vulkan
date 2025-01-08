@@ -26,12 +26,17 @@
 #include <string>
 #include <fstream>
 
+#define DEBUG_INFO(...) \
+printf(__VA_ARGS__);\
+printf("\n");
+
 // for texture load
 #define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
+#include "stb_image.h"
+#include "stb_image_write.h"
 
-const int WIDTH = 800;
-const int HEIGHT = 600;
+const int WIDTH = 1080;
+const int HEIGHT = 760;
 
 #define MAX_FRAMES_IN_FLIGHT 3
 
@@ -250,6 +255,9 @@ private:
     std::vector<VkImageView> swapChainImageViews;
     VkFormat swapChainImageFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkExtent2D swapChainExtent = { WIDTH, HEIGHT };// 这里需要设置，教程里面没有地方进行设置，就是0，0
+    // 测试变量，用于尝试把swapchain中的image拷贝出来
+    VkImage copySwapchainImage = nullptr;
+    VkDeviceMemory copySwapchainImageMemory = nullptr;
 
     // 如果仅仅是为了测试交换链的有效性是远远不够的，因为它还不能很好的与窗体surface兼容。创建交换链同样也需要很多设置，所以我们需要了解一些有关设置的细节
     // 基本上有三大类属性需要设置:
@@ -336,13 +344,14 @@ private:
         createSwapChain();
         // 创建图像视图
         createImageViews();
+
         // 创建渲染通道
         createRenderPass();
-
         // 创建ubo（uniform buffer object），需要在创建管线前完成（因为我们将要在创建管线中用到它）
         createDescriptorSetLayout();
         // 创建图形管线
         createGraphicsPipeline();
+
         // 创建命令缓冲
         createCommandPool();
         // ----------------Depth纹理相关（必须在framebuffer前创建）
@@ -565,6 +574,76 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
+    void copyImageToBuffer(VkImage image, VkBuffer buffer, uint32_t width, uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkBufferImageCopy region{};
+        region.bufferOffset = 0;
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = {
+            width,
+            height,
+            1
+        };
+
+        vkCmdCopyImageToBuffer(
+            commandBuffer,
+            image,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            buffer,
+            1,
+            &region
+        );
+        //vkCmdCopyBufferToImage(
+        //    commandBuffer,
+        //    buffer,
+        //    image,
+        //    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        //    1,
+        //    &region
+        //);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    void copyImageToImage(VkImage imageSrc, VkImage imageDst, uint32_t width, uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        VkImageCopy region{};
+        region.extent = { width, height, 1 };
+
+        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.mipLevel = 0;
+        region.srcSubresource.baseArrayLayer = 0;
+        region.srcSubresource.layerCount = 1;        
+        
+        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.dstSubresource.mipLevel = 0;
+        region.dstSubresource.baseArrayLayer = 0;
+        region.dstSubresource.layerCount = 1;
+
+
+        vkCmdCopyImage(
+            commandBuffer,
+            imageSrc,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            imageDst,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &region
+        );
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
     void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
@@ -632,13 +711,29 @@ private:
             sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
             destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
         else {
+            DEBUG_INFO("[error], unsupported layout transition!");
             throw std::invalid_argument("unsupported layout transition!");
         }
 
         //barrier.srcAccessMask = 0; // TODO
         //barrier.dstAccessMask = 0; // TODO
 
+        // 经过进一步的熟悉，发现vkCmdPipelineBarrier主要是用于转换Image的Layout使用的，从一个old layout转成new layout
         vkCmdPipelineBarrier(
             commandBuffer,
             sourceStage, destinationStage,
@@ -779,15 +874,48 @@ private:
         // 记得释放pixels
         stbi_image_free(pixels);
 
-        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
 
-        // 装换image的layout到dst
+        // 转换image的layout到dst，因为我们默认创建的image都是VK_IMAGE_LAYOUT_UNDEFINED（imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED，在createImage函数中我们是这样封装的）
+        // 这个地方我测试过，是没有办法直接把layout转换到既支持dst又支持src的！！！需要单独转换（见下面的测试代码）
         // Remember that we can do this because we don't care about its contents before performing the copy operation.
-        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, (VkImageLayout)(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL | VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));// 最后的Transfer_SRC是无效的，当例子放这里
+
         // 把staging buffer copy到textureImage中
         copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
 
+        // test code, try to copy image's content back
+        // 成功！！！，反向从vkImage中拿到pixels
+        if (0)
+        {
+            // 尝试把Image的layout从dst转换到src
+            transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, (VkImageLayout)(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
+
+            // 为staging buffer做准备，大致上和vbo和ibo是一样的
+            VkBuffer stagingBuffer;
+            VkDeviceMemory stagingBufferMemory;
+            createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+            // 这里又个细节需要注意，就是vk并不提供查询image的信息的api，比如宽度，高度，这样会降低性能，而且这些信息都是在我们创建image的时候自己提供的
+            // 所以如果需要这些信息，我们应该自己保存（比如key是image，然后带上一个结构体保存相关信息即可）
+            copyImageToBuffer(textureImage, stagingBuffer, texWidth, texHeight);
+
+            void* data;
+            vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+            // 保存为png,也可以调用stbi_write_bmp 保存为bmp
+            // 这里我没有下载对应的lib或者dll，暂时用不了，也就是一个保存，暂时不管它，写在这里有这个意思就可以了
+            //stbi_write_bmp("c:/users/administrator/desktop/12345.png", texWidth, texHeight, 4, data);
+            vkUnmapMemory(device, stagingBufferMemory);
+
+            vkDestroyBuffer(device, stagingBuffer, nullptr);
+            vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+            // 还原image layout，虽然我调试过不还原好像也没有影响。。。，但还是按照逻辑来正常处理，还原一下
+            transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, (VkImageLayout)(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL));
+        }
+
         // To be able to start sampling from the texture image in the shader, we need one last transition to prepare it for shader access:
+        // 这里是第二次的layout转换，把dst又转换成了shared_read_only_optimal，说明这个image的layout应该是可以多次根据需求进行转换的
         transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
         vkDestroyBuffer(device, stagingBuffer, nullptr);
@@ -897,6 +1025,7 @@ private:
 
     void createDescriptorSetLayout() {
 
+        DEBUG_INFO("------start create descriptor set layout, to bind the uniform & sampler");
         // 创建普通uniform描述符-----------------------------------
         VkDescriptorSetLayoutBinding uboLayoutBinding{};
         uboLayoutBinding.binding = 0;// 这里对应shader中的binding id，这里的id千万不能乱填，否则整个程序都会崩溃的
@@ -938,6 +1067,7 @@ private:
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
         }
+        DEBUG_INFO("------end create descriptor set layout, to bind the uniform & sampler");
     }
 
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -1194,8 +1324,43 @@ private:
         // 如果一切顺利，当再次运行程序时候，应该可以看到一下内容（也就是三角形绘制出来了）
         // 当时最后画面出来前，我还调试了很久，光看validation的信息其实不够，有些虽然有error，但是并不影响显示，首先我们可以调试的是clearcolor有没有生效，有的话
         // 第二步才是三角形，三角形当时因为没有修改shader，所以绘制是黑色，和clearcolor一样，我就以为出问题了，结果都已经画上了
-        // 这下大概对vk的绘制精华有一定总结了，主要的绘制还是在submitDrawCommands和drawFrame里面，涉及到绘制信号同步，已经绘制命令的发送方式！！
+        // 这下大概对vk的绘制精华有一定总结了，主要的绘制还是在submitDrawCommands和drawFrame里面，涉及到绘制信号同步，以及绘制命令的发送方式！！
         vkQueuePresentKHR(presentQueue, &presentInfo);
+
+        // test code, try to copy the image out of the swapchain(framebuffer)
+        // 未完成，本来想直接从swapchain的image中copy出来，但是貌似是行不通的，后面再找下其他方法，毕竟调试color_attachment很重要
+        if (0)
+        {
+            auto cmdBuffer = beginSingleTimeCommands();
+
+            // 为staging buffer做准备，大致上和vbo和ibo是一样的
+            VkBuffer stagingBuffer;
+            VkDeviceMemory stagingBufferMemory;
+            // 下面的size是创建swapchain时使用的extent以及color format，我们就可以算出size
+            createBuffer(WIDTH * HEIGHT * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+            // 初始化copy image
+            if (nullptr == copySwapchainImage) {
+                createImage(WIDTH, HEIGHT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, copySwapchainImage, copySwapchainImageMemory);
+            }
+            copyImageToImage(swapChainImages[imageIndex], copySwapchainImage, WIDTH, HEIGHT);
+
+            // 这里又个细节需要注意，就是vk并不提供查询image的信息的api，比如宽度，高度，这样会降低性能，而且这些信息都是在我们创建image的时候自己提供的
+            // 所以如果需要这些信息，我们应该自己保存（比如key是image，然后带上一个结构体保存相关信息即可）
+            //copyImageToBuffer(swapChainImages[imageIndex], stagingBuffer, WIDTH, HEIGHT);
+
+            //void* data;
+            //vkMapMemory(device, stagingBufferMemory, 0, WIDTH * HEIGHT * 4, 0, &data);
+            //// 保存为png,也可以调用stbi_write_bmp 保存为bmp
+            //// 这里我没有下载对应的lib或者dll，暂时用不了，也就是一个保存，暂时不管它，写在这里有这个意思就可以了
+            ////stbi_write_bmp("c:/users/administrator/desktop/12345.png", texWidth, texHeight, 4, data);
+            //vkUnmapMemory(device, stagingBufferMemory);
+
+            vkDestroyBuffer(device, stagingBuffer, nullptr);
+            vkFreeMemory(device, stagingBufferMemory, nullptr);
+
+            endSingleTimeCommands(cmdBuffer);
+        }
 
         // 如果运行时启用了validation layers并监视应用程序的内存使用情况，你会发现它在慢慢增加。原因是validation layers的实现期望与GPU同步。
         // 虽然在技术上是不需要的，但是一旦这样做，每一针帧不会出现明显的性能影响。
@@ -1345,16 +1510,20 @@ private:
             createInfo.pNext = nullptr;
         }
 
+        DEBUG_INFO("------start create vk instance......");
         if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
             throw std::runtime_error("failed to create instance!");
         }
+        DEBUG_INFO("------end create vk instance......");
     }
 
     void createSurface() {
         // 参数是VkInstance,GLFW窗体的指针，自定义分配器和用于存储VkSurfaceKHR变量的指针。对于不同平台统一返回VkResult。GLFW没有提供专用的函数销毁surface,但是可以简单的通过Vulkan原始的API完成:
+        DEBUG_INFO("------start create surface......");
         if (glfwCreateWindowSurface(instance, window, nullptr, &surface) != VK_SUCCESS) {
             throw std::runtime_error("failed to create window surface!");
         }
+        DEBUG_INFO("------end create surface......");
     }
 
     void populateDebugMessengerCreateInfo(VkDebugUtilsMessengerCreateInfoEXT& createInfo) {
@@ -1371,9 +1540,11 @@ private:
         VkDebugUtilsMessengerCreateInfoEXT createInfo;
         populateDebugMessengerCreateInfo(createInfo);
 
+        DEBUG_INFO("------start setup debug messaenger......");
         if (CreateDebugUtilsMessengerEXT(instance, &createInfo, nullptr, &debugMessenger) != VK_SUCCESS) {
             throw std::runtime_error("failed to set up debug messenger!");
         }
+        DEBUG_INFO("------end setup debug messaenger......");
     }
 
     void pickPhysicalDevice() {
@@ -1398,6 +1569,7 @@ private:
         if (physicalDevice == VK_NULL_HANDLE) {
             throw std::runtime_error("failed to find a suitable GPU!");
         }
+        DEBUG_INFO("------create physical device succeed");
     }
 
     void createLogicalDevice() {
@@ -1436,6 +1608,13 @@ private:
         createInfo.pQueueCreateInfos = queueCreateInfos.data();
 
         createInfo.pEnabledFeatures = &deviceFeatures;
+        // 尝试添加float16 ext，bs5中遇到过这个错误，有些shader中会要求这个ext
+        {
+            VkPhysicalDeviceVulkan12Features features = {};
+            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;       
+            features.shaderFloat16 = VK_TRUE;
+            createInfo.pNext = &features;
+        }
 
         createInfo.enabledExtensionCount = 0;
 
@@ -1452,15 +1631,19 @@ private:
             createInfo.enabledLayerCount = 0;
         }
 
+        DEBUG_INFO("------start create logic device......");
         if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &device) != VK_SUCCESS) {
             throw std::runtime_error("failed to create logical device!");
         }
+        DEBUG_INFO("------end create logic device......");
 
         vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
         vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
+        DEBUG_INFO("------get device queue(graphic[%x] & present[%x])", graphicsQueue, presentQueue);
     }
 
     void createSwapChain() {
+        DEBUG_INFO("------start create swap chain......");
         SwapChainSupportDetails swapChainSupport = querySwapChainSupport(physicalDevice);
 
         // swapchain中3个关键的参数，分别通过3个函数封装分别处理
@@ -1487,7 +1670,7 @@ private:
         // 尝试移除createInfo.imageExtent = extent;并在validation layers开启的条件下，validation layers会立刻捕获到有帮助的异常信息:
         createInfo.imageExtent = extent;
         createInfo.imageArrayLayers = 1;
-        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        createInfo.imageUsage = VkImageUsageFlagBits(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
         // imageArrayLayers指定每个图像组成的层数。除非我们开发3D应用程序，否则始终为1。imageUsage位字段指定在交换链中对图像进行的具体操作。在本小节中，我们将直接对它们进行渲染，这意味着它们作为颜色附件。
         // 也可以首先将图像渲染为单独的图像，进行后处理操作。在这种情况下可以使用像VK_IMAGE_USAGE_TRANSFER_DST_BIT这样的值，并使用内存操作将渲染的图像传输到交换链图像队列。
@@ -1520,7 +1703,7 @@ private:
         createInfo.presentMode = presentMode;
         createInfo.clipped = VK_TRUE;
 
-        // presentMode指向自己。如果clipped成员设置为VK_TRUE，意味着我们不关心被遮蔽的像素数据，比如由于其他的窗体置于前方时或者渲染的部分内容存在于可是区域之外，除非真的需要读取这些像素获数据进行处理，否则可以开启裁剪获得最佳性能。
+        // presentMode指向自己。如果clipped成员设置为VK_TRUE，意味着我们不关心被遮蔽的像素数据，比如由于其他的窗体置于前方时或者渲染的部分内容存在可视区域之外，除非真的需要读取这些像素获数据进行处理，否则可以开启裁剪获得最佳性能。
         createInfo.oldSwapchain = VK_NULL_HANDLE;
 
         // 最后一个字段oldSwapChain。Vulkan运行时，交换链可能在某些条件下被替换，比如窗口调整大小或者交换链需要重新分配更大的图像队列。在这种情况下，交换链实际上需要重新分配创建，并且必须在此字段中指定对旧的引用，用以回收资源。
@@ -1535,9 +1718,21 @@ private:
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
         swapChainImages.resize(imageCount);
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+
+        DEBUG_INFO("------end create swap chain......, get swapchain image count[%d](vkGetSwapchainImagesKHR) then generate swapchain images(vkImage)", imageCount);
+
+        // test code, try to verify the swapchain color attachment format, to see if we can copy the image directly
+        {
+            VkMemoryRequirements requirements;
+            vkGetImageMemoryRequirements(device, swapChainImages[0], &requirements);
+            if (requirements.memoryTypeBits & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+                DEBUG_INFO("swapchain's images are support HOST_VISIBLE, so wen can copy it directly, with vkCmdCopyImage??");
+            }
+        }
     }
 
     void createImageViews() {
+        DEBUG_INFO("------start create Image views(we can't use vkImage directly in the pipeline)");
         // 我们需要做的第一件事情需要定义保存图像视图集合的大小:
         swapChainImageViews.resize(swapChainImages.size());
         // 下一步，循环迭代所有的交换链图像
@@ -1545,10 +1740,12 @@ private:
             swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
         }
 
+        DEBUG_INFO("------end create Image views");
     }
 
     // 在将代码传递给渲染管线之前，我们必须将其封装到VkShaderModule对象中。让我们创建一个辅助函数createShaderModule实现该逻辑
     VkShaderModule createShaderModule(const std::vector<char>& code) {
+        DEBUG_INFO("------start create shader module");
         // 创建shader module是比较简单的，我们仅仅需要指定二进制码缓冲区的指针和它的具体长度。这些信息被填充在VkShaderModuleCreateInfo结构体中。
         // 需要留意的是字节码的大小是以字节指定的，但是字节码指针是一个uint32_t类型的指针，而不是一个char指针。所以我们使用reinterpret_cast进行转换指针。
         // 如下所示，当需要转换时，还需要确保数据满足uint32_t的对齐要求。幸运的是，数据存储在std::vector中，默认分配器已经确保数据满足最差情况下的对齐要求
@@ -1564,11 +1761,13 @@ private:
             throw std::runtime_error("failed to create shader module!");
         }
 
+        DEBUG_INFO("------end create shader module");
         // 参数与之前创建对象功能类似:逻辑设备，创建对象信息结构体的指针，自定义分配器和保存结果的句柄变量。在shader module创建完毕后，可以对二进制码的缓冲区进行立即的释放。最后不要忘记返回创建好的shader module
         return shaderModule;
     }
 
     void createRenderPass() {
+        DEBUG_INFO("------start create render pass");
         // 在我们的例子中，我们将只有一个颜色缓冲区附件，它由交换链中的一个图像所表示
         // format是颜色附件的格式，它应该与交换链中图像的格式相匹配，同时我们不会做任何多重采样的工作，所以采样器设置为1
         VkAttachmentDescription colorAttachment = {};
@@ -1598,11 +1797,11 @@ private:
         // VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : 图像作为目标，用于内存COPY操作
         // 我们会深入讨论这些内容在纹理章节，现在最重要的是为需要转变的图像指定合适的layout布局进行操作
         // initialLayout指定图像在开始进入渲染通道render pass前将要使用的布局结构。finalLayout指定当渲染通道结束自动变换时使用的布局。
-        // 使用VK_IMAGE_LAYOUT_UNDEFINED设置initialLayout，意为不关心图像之前的布局。特殊值表明图像的内容不确定会被保留，但是这并不总要，因为无论如何我们都要清理它。
+        // 使用VK_IMAGE_LAYOUT_UNDEFINED设置initialLayout，意为不关心图像之前的布局。特殊值表明图像的内容不确定会被保留，但是这并不重要，因为无论如何我们都要清理它。
         // 我们希望图像渲染完毕后使用交换链进行呈现，这就解释了为什么finalLayout要设置为VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
         //colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        colorAttachment.initialLayout = VkImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        colorAttachment.finalLayout = VkImageLayout(VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
         // 子通道和附件引用
         // 一个单独的渲染通道可以由多个子通道组成。子通道是渲染操作的一个序列。子通道作用与后续的渲染操作，并依赖之前渲染通道输出到帧缓冲区的内容。
@@ -1679,9 +1878,11 @@ private:
         if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
             throw std::runtime_error("failed to create render pass!");
         }
+        DEBUG_INFO("------end create render pass, set the color attachment & depth-stencil attachment's base info, also set subpass(we only have one here)");
     }
 
     void createGraphicsPipeline() {
+        DEBUG_INFO("------start create graphic pipeline(create vertex shader & fragment shader & vertexInputInfo & viewport & rasterizer & blend)");
         auto vertShaderCode = readFile("./sample01_vert.spv");
         auto fragShaderCode = readFile("./sample01_frag.spv");
 
@@ -1983,12 +2184,15 @@ private:
         }
 
         // 现在运行程序，确认所有工作正常，并创建图形管线成功！我们已经无比接近在屏幕上绘制出东西来了。在接下来的几个章节中，我们将从交换链图像中设置实际的帧缓冲区，并准备绘制命令
+        DEBUG_INFO("------end create graphic pipeline");
     }
 
     void createFramebuffers() {
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
         // 我们接下来迭代左右的图像视图并通过它们创建对应的framebuffers
+        // framebuffer用到的image其实就是swapchain里面的，在vk中，swapchain和framebuffer是强相关，所以最后要实现OpenGL的readPixel，我们也是拷贝的swapchain中的image
+        // 只是说swapchain创建出来的Image(view)需要装载到framebuffer中
         for (size_t i = 0; i < swapChainImageViews.size(); i++) {
             std::array<VkImageView, 2> attachments = {
                 swapChainImageViews[i],
