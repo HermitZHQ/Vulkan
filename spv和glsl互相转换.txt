@@ -1,0 +1,35 @@
+1、  glsl转spv:
+
+打开cmd，在 vulkan的装目录 bin中找到glslangValidator.exe，并拖到cmd窗口中；
+
+输入空格，再输入-V，一定是大写的V。
+
+再输入空格，将要转换的 vert文件或frag文件拖入到 cmd中。
+
+再输入空格，输入-o，是字母o，大小写都行，不是零。
+
+再输入空格，再将vert或frag文件拖入到cmd中，并在.spv。这个是生成的spv文件的目录和文件名。也可以自己修改成别的。
+
+按回车，即在vert或frag目录下生成spv文件。
+
+例：glslangValidator.exe -V D:/test.vert -o D:/test.spv
+
+2、 spv转glsl:
+
+打开 cmd，在vulkan的安装目录bin中找到 spirv-cross.exe，拖入cmd窗口。
+
+再输入空格，输入--version，是两个减号和version，中间没有空格，
+
+再输入空格，输入转换成glsl后的版本号，如330或者450等。
+
+再输入空格，将 spv文件拖入到 cmd窗口中。
+
+再输入空格，输入--output，两个减号和output，中间没有空格。
+
+再输入空格，再把要 spv文件拖入到cmd窗口中。
+
+将最后的.spv删除，换成 .vert或 .frag。
+
+按回车，会在spv的同目录中生成转换后的glsl文件。
+
+例：spirv-cross.exe --version 450 d:/test.spv --output d:/test.vert
