@@ -1303,61 +1303,23 @@ private:
     }
 
     void testComputeShader() {
-        VkCommandBufferBeginInfo beginInfo = {};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
-        beginInfo.pInheritanceInfo = nullptr; // Optional
 
-        vkBeginCommandBuffer(commandBuffers[0], &beginInfo);
-        
+        auto cmdBuf = beginSingleTimeCommands();        
 
         // 第二个参数指定具体管线类型，graphics or compute pipeline。
         // 我们告诉Vulkan在图形管线中每一个操作如何执行及哪个附件将会在片段着色器中使用，所以剩下的就是告诉它绘制三角形
-        vkCmdBindPipeline(commandBuffers[0], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
 
-        // 绑定描述符急，才能最终试ubo的系列设置生效？
-        vkCmdBindDescriptorSets(commandBuffers[0], VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &descriptorSets_compute[0], 0, nullptr);
+        // 绑定描述符集，才能最终试ubo的系列设置生效？
+        vkCmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &descriptorSets_compute[0], 0, nullptr);
 
-        vkCmdDispatch(commandBuffers[0], 1, 1, 1);
+        vkCmdDispatch(cmdBuf, 1, 1, 1);
 
         // 应为我使用的host visible，所以绑定后，就可以直接在mapData的地址，观察数据的变化了
         void* mapData = nullptr;
         vkMapMemory(device, ssboBufferMemory, 0, 40, 0, &mapData);
 
-        // 并停止记录命令缓冲区的工作:
-        if (vkEndCommandBuffer(commandBuffers[0]) != VK_SUCCESS) {
-            throw std::runtime_error("failed to record command buffer!");
-        }
-
-        // ---------------------上面只是封装好了命令，并没有执行，要执行的话，必须调用vkQueueSubmit，我们才能看到compute shader执行后的数据变化
-        // 提交命令缓冲区
-        // 队列提交和同步通过VkSubmitInfo结构体进行参数配置。
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
-        // 前三个参数指定在执行开始之前要等待的哪个信号量及要等待的通道的哪个阶段。
-        // 为了向图像写入颜色，我们会等待图像状态变为available，所我们指定写入颜色附件的图形管线阶段。
-        // 理论上这意味着，具体的顶点着色器开始执行，而图像不可用。waitStages数组对应pWaitSemaphores中具有相同索引的信号量
-        VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
-        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = waitSemaphores;
-        submitInfo.pWaitDstStageMask = waitStages;
-        // 接下来的两个参数指定哪个命令缓冲区被实际提交执行。如初期提到的，我们应该提交命令缓冲区，它将我们刚获取的交换链图像做为颜色附件进行绑定。
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffers[0];
-
-        // ------结束信号
-        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = signalSemaphores;
-        // signalSemaphoreCount和pSignalSemaphores参数指定了当命令缓冲区执行结束向哪些信号量发出信号。根据我们的需要使用renderFinishedSemaphore
-        // 使用vkQueueSubmit函数向图像队列提交命令缓冲区。当开销负载比较大的时候，处于效率考虑，函数可以持有VkSubmitInfo结构体数组。
-        // 最后一个参数引用了一个可选的栅栏，当命令缓冲区执行完毕时候它会被发送信号。我们使用信号量进行同步，所以我们需要传递VK_NULL_HANDLE
-        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
-            throw std::runtime_error("failed to submit draw command buffer!");
-        }
-
+        endSingleTimeCommands(cmdBuf);
         // ------vkQueueSubmit后，可以立即看到内存中compute shader执行后的变化结果
     }
 
