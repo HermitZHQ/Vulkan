@@ -240,12 +240,17 @@ private:
     // 可以在着色器中使用uniform，它是类似与动态状态变量的全局变量，可以在绘画时修改，可以更改着色器的行为而无需重新创建它们。它们通常用于将变换矩阵传递到顶点着色器或者在片段着色器冲创建纹理采样器。
     // 这些uniform数值需要在管线创建过程中，通过VkPipelineLayout对象指定。即使在后续内容中用到，我们也仍然需要创建一个空的pipeline layout
     VkPipelineLayout pipelineLayout;
+    VkPipelineLayout computePipelineLayout; // 不同的shader（比如compute），其实就是装载在不同的pipelineLayout中而已，要切换shader就是在draw之前去切换pipelineLayout就可以了
 
+    // compute storage buffer相关变量------
+    VkDescriptorSetLayout ssboDescriptorSetLayout; 
     // uniform buffer object相关变量--------
     VkDescriptorSetLayout descriptorSetLayout;
     // 描述符池 + 描述符集
     VkDescriptorPool descriptorPool;
     std::vector<VkDescriptorSet> descriptorSets;
+    VkDescriptorPool descriptorPool_compute;
+    std::vector<VkDescriptorSet> descriptorSets_compute; // draw之前都需要设置pipeline以及descriptor，相当于就是shader和shader中的变量描述符（简单说的话）
 
     VkSwapchainKHR swapChain;// 现在添加一个类成员变量存储VkSwapchainKHR对象:
     // 交换链创建后，需要获取VkImage相关的句柄。它会在后续渲染的章节中引用。添加类成员变量存储该句柄:
@@ -287,6 +292,9 @@ private:
     std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
     std::vector<void*> uniformBuffersMapped;
+    // compute shader, ssbo, shader storage buffer object
+    VkBuffer ssboBuffer;
+    VkDeviceMemory ssboBufferMemory;
 
 
     // texture相关--------
@@ -303,6 +311,7 @@ private:
     VkImageView depthImageView;
 
     VkPipeline graphicsPipeline;
+    VkPipeline computePipeline; // 不同的pipeline绑定不同的shader
     // Vulkan 渲染通道，在我们完成管线的创建工作之前，我们需要告诉Vulkan渲染时候使用的framebuffer帧缓冲区附件相关信息。
     // 我们需要指定多少个颜色和深度缓冲区将会被使用，指定多少个采样器被用到及在整个渲染操作中相关的内容如何处理。
     // 所有的这些信息都被封装在一个叫做 render pass 的对象中
@@ -348,9 +357,17 @@ private:
         // 创建渲染通道
         createRenderPass();
         // 创建ubo（uniform buffer object），需要在创建管线前完成（因为我们将要在创建管线中用到它）
+        // 也会创建compute pipeline用到的layout，可以一起创建，但是用到的pipeline不一样
+        // [TODO]因为目前代码比较简单，就没有分开，其实不同pipeline的descriptor应该分开比会较清晰一些
         createDescriptorSetLayout();
         // 创建图形管线
+        // 这里可以创建多条图形管线，用于实现不同的shader效果（一般就是绑定的shader不同，其他可能都一样），最简单的示例就是我们可以用shader绘制红色三角形或者彩色三角形
+        // 关键在于最后draw之前绑定的pipeline是什么，如下
+        //if(_selectedShader == 0) {vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _trianglePipeline);}
+        //else {vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, _redTrianglePipeline);}
         createGraphicsPipeline();
+        // 创建compute pipeline，之前把compute的pipeline写到图形管线中了，是不对的，两个管线是必须要分开创建的，不能混合到一起
+        createComputePipeline();
 
         // 创建命令缓冲
         createCommandPool();
@@ -374,15 +391,29 @@ private:
         createIndexBuffer();
         // 创建ubo相关资源
         createUniformBuffers();
+        // 创建compute中的ssbo资源
+        createSSBOBuffer();
         // 创建描述符池（ubo等buffer使用）
         createDescriptorPool();
+        // 创建描述符池（ssbo使用，compute shader用的）
+        createDescriptorPoolForComputeShader();
         // 创建描述符集
         createDescriptorSets();
+        createDescriptorSetsForComputeShader();
 
         // 现在开始使用一个createCommandBuffers函数来分配和记录每一个交换链图像将要应用的命令
         createCommandBuffers();
         // 为了创建信号量semaphores，我们将要新增本系列教程最后一个函数: createSemaphores:
         createSemaphores();
+
+        // test compute shader（简化版，已验证成功）
+        // 目前已测试成功，最简单的compute shader，算平方的，endCommandBuffer后还不会改变，需要commit后才会改变
+        // 所以，我们可以在mainloop中打断点（第二次进入后，就可以看到平方值的结果了），观察vkBuffer，map后的值，因为我设置的buffer是host visible的，所以shader计算后
+        // 我们可以直接在这个bufferMemory上看到变化
+        // 【重要】测试的时候，需要屏蔽下面的submitDrawComands，不能连续两次设置command buffer，这样会覆盖掉compute的command
+        // 这个问题应该是可以改进的，后面再看看，应该就是及时的提交commit就可以？（是的，已验证）
+        // 所以不需要注释了
+        testComputeShader();
 
         submitDrawCommands(0);
     }
@@ -971,6 +1002,44 @@ private:
         }
     }
 
+    // 相当于不同的shader有不同的描述符集（ubo ssbo等的描述）
+    void createDescriptorSetsForComputeShader() {
+        // 描述符集的分配需要使用到描述符池，所以我们这个函数调用应该在Descriptor pool创建之后
+        // 综合目前看的情况来说，一般你想创建一个对象，比如descriptorPool，你即便没有创建描述符池，但是根据它结构体的填充，你也必须要回溯到之前的步骤（才能填充描述符池这种成员变量）
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, ssboDescriptorSetLayout);
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocInfo.descriptorPool = descriptorPool_compute;
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        allocInfo.pSetLayouts = layouts.data();
+
+        descriptorSets_compute.resize(MAX_FRAMES_IN_FLIGHT);
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets_compute.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+        // 描述符集是目前唯一说明不用显示释放的，它会在释放描述符池的时候一起释放（也就是说我们还是需要释放描述符池）
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+
+            VkDescriptorBufferInfo bufferInfo2{};
+            bufferInfo2.buffer = ssboBuffer;
+            bufferInfo2.offset = 0;
+            bufferInfo2.range = sizeof(GLfloat) * 10;
+
+            std::array<VkWriteDescriptorSet, 1> descriptorWrites{};
+
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[0].dstSet = descriptorSets_compute[i];
+            descriptorWrites[0].dstBinding = 0;
+            descriptorWrites[0].dstArrayElement = 0;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[0].descriptorCount = 1;
+            descriptorWrites[0].pBufferInfo = &bufferInfo2;
+
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+        }
+    }
+
     void createDescriptorPool() {
         VkDescriptorPoolSize poolSize{};
         poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -984,6 +1053,23 @@ private:
         poolInfo.flags = 0;// default vaule
 
         if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    void createDescriptorPoolForComputeShader() {
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolInfo.flags = 0;// default vaule
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool_compute) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor pool!");
         }
     }
@@ -1007,6 +1093,16 @@ private:
         ubo.proj[1][1] *= -1;
 
         memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+    }
+
+    void createSSBOBuffer() {
+        GLfloat data[10] = { 1,2,3,4,5,6,7,8,9,10 };
+        createBuffer(sizeof(data), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, ssboBuffer, ssboBufferMemory);
+
+        void* mapData = nullptr;
+        vkMapMemory(device, ssboBufferMemory, 0, sizeof(data), 0, &mapData);
+        memcpy_s(mapData, sizeof(data), data, sizeof(data));
+        vkUnmapMemory(device, ssboBufferMemory);
     }
 
     void createUniformBuffers() {
@@ -1046,27 +1142,48 @@ private:
         // It is possible to use texture sampling in the vertex shader, for example to dynamically deform a grid of vertices by a heightmap.
         samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+        // 创建compute shader中的storage buffer object-----------------------------
+        VkDescriptorSetLayoutBinding ssboLayoutBinding{};
+        ssboLayoutBinding.binding = 0;
+        ssboLayoutBinding.descriptorCount = 1;
+        ssboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ssboLayoutBinding.pImmutableSamplers = nullptr;
+        ssboLayoutBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
         std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboLayoutBinding, samplerLayoutBinding };
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
         layoutInfo.pBindings = bindings.data();
 
-        std::array<VkDescriptorPoolSize, 2> poolSizes{};
-        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
-        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // ------下面这段，没有地方引用，先注释掉，可能是之前哪里写错遗留的
+        // std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        // poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        // poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        // poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
-        VkDescriptorPoolCreateInfo poolInfo{};
-        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-        poolInfo.pPoolSizes = poolSizes.data();
-        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // VkDescriptorPoolCreateInfo poolInfo{};
+        // poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        // poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        // poolInfo.pPoolSizes = poolSizes.data();
+        // poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create descriptor set layout!");
+            throw std::runtime_error("failed to create (graphic)descriptor set layout!");
         }
+        DEBUG_INFO("create graphic descriptor set layout succeed");
+
+        std::array<VkDescriptorSetLayoutBinding, 1> bindings_ssbo = { ssboLayoutBinding };
+        VkDescriptorSetLayoutCreateInfo layoutInfo_ssbo{};
+        layoutInfo_ssbo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutInfo_ssbo.bindingCount = static_cast<uint32_t>(bindings_ssbo.size());
+        layoutInfo_ssbo.pBindings = bindings_ssbo.data();
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo_ssbo, nullptr, &ssboDescriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create (compute)descriptor set layout!");
+        }
+        DEBUG_INFO("create compute descriptor set layout succeed");
+
         DEBUG_INFO("------end create descriptor set layout, to bind the uniform & sampler");
     }
 
@@ -1183,6 +1300,65 @@ private:
         vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
 
         endSingleTimeCommands(commandBuffer);
+    }
+
+    void testComputeShader() {
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+        beginInfo.pInheritanceInfo = nullptr; // Optional
+
+        vkBeginCommandBuffer(commandBuffers[0], &beginInfo);
+        
+
+        // 第二个参数指定具体管线类型，graphics or compute pipeline。
+        // 我们告诉Vulkan在图形管线中每一个操作如何执行及哪个附件将会在片段着色器中使用，所以剩下的就是告诉它绘制三角形
+        vkCmdBindPipeline(commandBuffers[0], VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+
+        // 绑定描述符急，才能最终试ubo的系列设置生效？
+        vkCmdBindDescriptorSets(commandBuffers[0], VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout, 0, 1, &descriptorSets_compute[0], 0, nullptr);
+
+        vkCmdDispatch(commandBuffers[0], 1, 1, 1);
+
+        // 应为我使用的host visible，所以绑定后，就可以直接在mapData的地址，观察数据的变化了
+        void* mapData = nullptr;
+        vkMapMemory(device, ssboBufferMemory, 0, 40, 0, &mapData);
+
+        // 并停止记录命令缓冲区的工作:
+        if (vkEndCommandBuffer(commandBuffers[0]) != VK_SUCCESS) {
+            throw std::runtime_error("failed to record command buffer!");
+        }
+
+        // ---------------------上面只是封装好了命令，并没有执行，要执行的话，必须调用vkQueueSubmit，我们才能看到compute shader执行后的数据变化
+        // 提交命令缓冲区
+        // 队列提交和同步通过VkSubmitInfo结构体进行参数配置。
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        // 前三个参数指定在执行开始之前要等待的哪个信号量及要等待的通道的哪个阶段。
+        // 为了向图像写入颜色，我们会等待图像状态变为available，所我们指定写入颜色附件的图形管线阶段。
+        // 理论上这意味着，具体的顶点着色器开始执行，而图像不可用。waitStages数组对应pWaitSemaphores中具有相同索引的信号量
+        VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        submitInfo.pWaitDstStageMask = waitStages;
+        // 接下来的两个参数指定哪个命令缓冲区被实际提交执行。如初期提到的，我们应该提交命令缓冲区，它将我们刚获取的交换链图像做为颜色附件进行绑定。
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffers[0];
+
+        // ------结束信号
+        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+        // signalSemaphoreCount和pSignalSemaphores参数指定了当命令缓冲区执行结束向哪些信号量发出信号。根据我们的需要使用renderFinishedSemaphore
+        // 使用vkQueueSubmit函数向图像队列提交命令缓冲区。当开销负载比较大的时候，处于效率考虑，函数可以持有VkSubmitInfo结构体数组。
+        // 最后一个参数引用了一个可选的栅栏，当命令缓冲区执行完毕时候它会被发送信号。我们使用信号量进行同步，所以我们需要传递VK_NULL_HANDLE
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
+            throw std::runtime_error("failed to submit draw command buffer!");
+        }
+
+        // ------vkQueueSubmit后，可以立即看到内存中compute shader执行后的变化结果
     }
 
     void submitDrawCommands(uint32_t currentFrame) {
@@ -2187,6 +2363,45 @@ private:
         DEBUG_INFO("------end create graphic pipeline");
     }
 
+    void createComputePipeline() {
+
+        // 管道布局------
+        // 该结构体还指定了push常量，这是将动态值传递给着色器的另一个方式。pipeline layout可以在整个程序的生命周期内引用，所以它在程序退出的时候进行销毁
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 1; // Optional
+        pipelineLayoutInfo.pSetLayouts = &ssboDescriptorSetLayout; // Optional
+        pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
+        pipelineLayoutInfo.pPushConstantRanges = 0; // Optional
+
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, 0, &computePipelineLayout) != VK_SUCCESS) {
+            DEBUG_INFO("create pipe line layout failed......");
+        }
+
+        auto compShaderCode = readFile("./sample01_comp.spv");
+        VkShaderModule compShaderModule;
+        compShaderModule = createShaderModule(compShaderCode);
+
+        // 计算着色器相关
+        VkPipelineShaderStageCreateInfo compShaderStageInfo = {};
+        compShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        compShaderStageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        compShaderStageInfo.module = compShaderModule;
+        compShaderStageInfo.pName = "main";
+
+        VkComputePipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        pipelineInfo.layout = computePipelineLayout;
+        pipelineInfo.stage = compShaderStageInfo;
+
+        if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &computePipeline) != VK_SUCCESS) {
+            DEBUG_INFO("[error] failed to create compute pipe line......");
+            throw std::runtime_error("failed to create compute pipeline!");
+        }
+
+        DEBUG_INFO("create compute pipe line succeed");
+    }
+
     void createFramebuffers() {
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
@@ -2433,7 +2648,7 @@ private:
         int i = 0;
         for (const auto& queueFamily : queueFamilies) {
             // 检测得到的队列中，是否支持图形队列，其他常用队列还有compute和transfer，但是我们在3d绘制程序中，肯定是需要优先支持图形（Graphics）的
-            if (queueFamily.queueCount > 0 && queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+            if (queueFamily.queueCount > 0 && (queueFamily.queueFlags & VK_QUEUE_GRAPHICS_BIT) && (queueFamily.queueFlags & VK_QUEUE_COMPUTE_BIT)) {
                 indices.graphicsFamily = i;
             }
 

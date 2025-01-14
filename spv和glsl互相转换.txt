@@ -1,3 +1,23 @@
+    .conf   to provide a config file that replaces the default configuration
+            (see -c option below for generating a template)
+    .vert   for a vertex shader
+    .tesc   for a tessellation control shader
+    .tese   for a tessellation evaluation shader
+    .geom   for a geometry shader
+    .frag   for a fragment shader
+    .comp   for a compute shader
+    .mesh   for a mesh shader
+    .task   for a task shader
+    .rgen    for a ray generation shader
+    .rint    for a ray intersection shader
+    .rahit   for a ray any hit shader
+    .rchit   for a ray closest hit shader
+    .rmiss   for a ray miss shader
+    .rcall   for a ray callable shader
+    .glsl   for .vert.glsl, .tesc.glsl, ..., .comp.glsl compound suffixes
+    .hlsl   for .vert.hlsl, .tesc.hlsl, ..., .comp.hlsl compound suffixes
+这上面是文件后缀需要用到的格式，不能乱填。。。不然不会编译
+------------------------------------------------------------------------------------
 1、  glsl转spv:
 
 打开cmd，在 vulkan的装目录 bin中找到glslangValidator.exe，并拖到cmd窗口中；
